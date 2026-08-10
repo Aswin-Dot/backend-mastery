@@ -71,15 +71,24 @@ export function roadmapView(store) {
     else paceLine = "on pace";
   }
 
+  const waiting = store.daysUntilStart();
+  const startLabel = store.plannedStart()
+    ? new Date(`${store.plannedStart()}T00:00:00`).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" })
+    : null;
+
+  const kicker = waiting
+    ? `Day 1 begins ${escapeHtml(startLabel)} · ${waiting} day${waiting > 1 ? "s" : ""} to go`
+    : `Today · Day ${next?.day} of ${store.total}`;
+
   const dispatch = next
     ? `
     <div class="dispatch rise-in" style="--i:2">
       <div class="dispatch__body">
-        <div class="dispatch__kicker">Today · Day ${next.day} of ${store.total}</div>
+        <div class="dispatch__kicker">${kicker}</div>
         <h2 class="dispatch__title">${escapeHtml(next.title)}</h2>
         <p class="dispatch__sum">${escapeHtml(next.summary)}</p>
       </div>
-      <a class="btn btn--go" href="#/module/${next.id}">Start · ${fmtMins(next.estMinutes)}</a>
+      <a class="btn btn--go" href="#/module/${next.id}">${waiting ? "Read ahead" : "Start"} · ${fmtMins(next.estMinutes)}</a>
     </div>`
     : `
     <div class="dispatch rise-in" style="--i:2">
@@ -93,7 +102,7 @@ export function roadmapView(store) {
 
   const stats = [
     `${done}/${store.total} modules`,
-    paceLine,
+    waiting ? `starts ${fmtDate(new Date(`${store.plannedStart()}T00:00:00`))}` : paceLine,
     done < store.total ? `${Math.round(store.minutesRemaining() / 60)} hrs left` : "",
     eta ? `finish ~${fmtDate(eta)}` : "",
   ].filter(Boolean);
@@ -386,6 +395,16 @@ export function settingsView(store) {
           <label for="repo">Repo name</label>
           <input type="text" id="repo" value="${escapeHtml(s.repo)}" spellcheck="false">
         </div>
+      </div>
+
+      <div class="field">
+        <label for="startsOn">Day 1 date</label>
+        <input type="date" id="startsOn" value="${escapeHtml(store.plannedStart() || "")}">
+        <p class="field__note">
+          Anchors your pace and the daily alert. ${store.daysUntilStart()
+            ? `Day 1 is <strong>${store.daysUntilStart()} day${store.daysUntilStart() > 1 ? "s" : ""}</strong> away — the alert stays quiet until then.`
+            : "Change it if you need to restart the clock."}
+        </p>
       </div>
 
       <div class="field">

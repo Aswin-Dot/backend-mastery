@@ -176,6 +176,7 @@ function wireSettings() {
       repo: val("repo"),
       unlockAll: document.getElementById("unlockAll").checked,
     });
+    store.setStartDate(val("startsOn"));
     toast("Saved.", "ok");
     showSettings();
   });

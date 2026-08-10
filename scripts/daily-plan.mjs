@@ -80,9 +80,25 @@ function idleDays() {
   return dayNum(today) - dayNum(stamp(new Date(progress.lastActivity)));
 }
 
+/** Scheduled Day 1, falling back to the first completion's day. */
+function plannedStart() {
+  if (progress.startsOn) return progress.startsOn;
+  if (progress.startedAt) return stamp(new Date(progress.startedAt));
+  return null;
+}
+
+/** Days until Day 1; 0 once underway, null if unknown. */
+function daysUntilStart() {
+  const s = plannedStart();
+  if (!s) return null;
+  return Math.max(0, dayNum(s) - dayNum(today));
+}
+
 function pace() {
-  if (!progress.startedAt) return null;
-  const elapsed = dayNum(today) - dayNum(stamp(new Date(progress.startedAt))) + 1;
+  const s = plannedStart();
+  if (!s) return null;
+  const elapsed = dayNum(today) - dayNum(s) + 1;
+  if (elapsed <= 0) return null;
   return doneCount - elapsed;
 }
 
@@ -108,6 +124,26 @@ function statusLine() {
 }
 
 function buildBody() {
+  const waiting = daysUntilStart();
+
+  // Before Day 1: a single heads-up the day before, silence otherwise.
+  if (waiting) {
+    const when = new Date(`${plannedStart()}T00:00:00Z`).toLocaleDateString("en-GB", {
+      timeZone: "UTC", weekday: "long", day: "numeric", month: "long",
+    });
+    return [
+      `## Day 1 starts ${waiting === 1 ? "tomorrow" : `in ${waiting} days`}`,
+      "",
+      `**${when}** — first up is *${due.title}* (${fmtMins(due.estMinutes)}).`,
+      "",
+      `Nothing to do today, @${owner}. If you want a head start, the module is already open:`,
+      "",
+      `### 👉 [Read Day 1 ahead →](${siteUrl}#/module/${due.id})`,
+      "",
+      `<sub>@${owner} · posted by the daily-plan workflow · ${today}</sub>`,
+    ].join("\n");
+  }
+
   if (!due) {
     return [
       `## 🏔 All ${total} days complete`,
@@ -149,6 +185,13 @@ function buildBody() {
 }
 
 function buildPush() {
+  const waiting = daysUntilStart();
+  if (waiting) {
+    return {
+      title: `Day 1 starts ${waiting === 1 ? "tomorrow" : `in ${waiting} days`}`,
+      body: `First up: ${due.title} (${fmtMins(due.estMinutes)}).`,
+    };
+  }
   if (!due) return { title: "All 45 days complete 🏔", body: "The core path is done. Side quests await." };
   return {
     title: `Day ${due.day}: ${due.title}`,
@@ -218,6 +261,13 @@ async function pushNtfy(topic) {
 }
 
 /* ── run ───────────────────────────────────────────────── */
+
+// More than a day before Day 1 there is nothing worth a notification.
+const waitingDays = daysUntilStart();
+if (waitingDays > 1 && !DRY) {
+  console.log(`Day 1 is ${waitingDays} days away (${plannedStart()}) — staying quiet.`);
+  process.exit(0);
+}
 
 const body = buildBody();
 

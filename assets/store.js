@@ -15,7 +15,8 @@ const DAY_MS = 86400000;
 
 const defaultProgress = () => ({
   version: 1,
-  startedAt: null,
+  startsOn: null,      // planned Day 1 (YYYY-MM-DD) — anchors pace and the daily alert
+  startedAt: null,     // when the first module was actually completed
   lastActivity: null,
   dailyMinutes: 90,
   timezone: "Asia/Kolkata",
@@ -155,26 +156,52 @@ export class Store {
     return n;
   }
 
-  /** Days since the first completion, 1-based. Null before starting. */
+  /**
+   * The scheduled Day 1 (YYYY-MM-DD). Falls back to the day of the first
+   * completion so pace still works if no date was ever set.
+   */
+  plannedStart() {
+    if (this.progress.startsOn) return this.progress.startsOn;
+    if (this.progress.startedAt) return dayStamp(new Date(this.progress.startedAt), this.progress.timezone);
+    return null;
+  }
+
+  /** Days until Day 1. 0 once underway, null if no start date is known. */
+  daysUntilStart() {
+    const start = this.plannedStart();
+    if (!start) return null;
+    const today = dayNumber(dayStamp(new Date(), this.progress.timezone));
+    return Math.max(0, dayNumber(start) - today);
+  }
+
+  /** Days elapsed since Day 1, 1-based. 0 before the start date. */
   elapsedDays() {
-    if (!this.progress.startedAt) return null;
-    const tz = this.progress.timezone;
-    const start = dayNumber(dayStamp(new Date(this.progress.startedAt), tz));
-    return dayNumber(dayStamp(new Date(), tz)) - start + 1;
+    const start = this.plannedStart();
+    if (!start) return null;
+    const today = dayNumber(dayStamp(new Date(), this.progress.timezone));
+    return Math.max(0, today - dayNumber(start) + 1);
   }
 
   /** Positive = ahead of the one-module-a-day pace, negative = behind. */
   pace() {
     const elapsed = this.elapsedDays();
-    if (elapsed === null) return null;
+    if (!elapsed) return null; // not started, or no start date
     return this.doneCount() - elapsed;
   }
 
-  /** Projected finish date at one module per day from today. */
+  /** Projected finish at one module per day, anchored to the later of today/Day 1. */
   etaDate() {
     const remaining = this.total - this.doneCount();
     if (remaining <= 0) return null;
-    return new Date(Date.now() + remaining * DAY_MS);
+    const today = dayNumber(dayStamp(new Date(), this.progress.timezone));
+    const start = this.plannedStart();
+    const anchor = Math.max(today, start ? dayNumber(start) : today);
+    return new Date((anchor + remaining - 1) * DAY_MS);
+  }
+
+  setStartDate(date) {
+    this.progress.startsOn = date || null;
+    this.touch();
   }
 
   minutesRemaining() {
@@ -257,6 +284,7 @@ export class Store {
     }
     const starts = [a.startedAt, b.startedAt].filter(Boolean).sort();
     if (starts.length) out.startedAt = starts[0];
+    out.startsOn = a.startsOn || b.startsOn || null;
     const acts = [a.lastActivity, b.lastActivity].filter(Boolean).sort();
     if (acts.length) out.lastActivity = acts[acts.length - 1];
     return out;
