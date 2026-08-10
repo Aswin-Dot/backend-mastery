@@ -1,0 +1,793 @@
+{
+  "phaseId": "p4",
+  "modules": {
+    "m4-1": {
+      "content": "## The problem\n\nNadia is on a train. She taps **Buy** on a vintage camera listed at $249.00. The spinner turns, the tunnel eats her connection, nothing happens. She taps again. When signal comes back she has two order confirmations and two charges, and your support inbox has its first message of the day.\n\nSame afternoon, two different buyers open that same listing eleven milliseconds apart and both tap Buy. Both requests read `status = 'active'`. Both insert an order. Both mark the listing sold. One buyer gets a camera. The other gets an apology, a refund, and leaves a review that says \"sold me something they didn't have.\"\n\nNeither of those is a bug in your business logic. Both are bugs in your assumptions about time: you wrote the code as if requests arrive one at a time and each finishes before the next begins. Money is where that assumption stops being an inconvenience and starts being a chargeback.\n\n## The idea\n\nFour separate tools fix four separate problems here, and it pays to keep them apart in your head.\n\n**Money is counted, not measured.** Store it as an integer number of the smallest unit: cents, paise, yen. A float is an approximation, and approximations compound.\n\n```ts\n0.1 + 0.2              // 0.30000000000000004\n0.1 + 0.2 === 0.3      // false\n19.99 * 3              // 59.970000000000006\n```\n\nThat last line is an invoice off by six billionths of a cent. Sum a thousand of those, reconcile against what the payment processor actually captured, and you will spend a Friday on it.\n\n**A transaction is a git commit.** You stage several changes and either the whole thing lands or the working tree looks like you never touched it. There is no state where half the files changed.\n\n**A row lock is the café bathroom key.** One key on the counter. You take it, you're the only one in there, you bring it back. Everyone else waits at the counter instead of walking in on you.\n\n**An idempotency key is the client naming the attempt, not the result.** Nadia's two taps are the same intent, sent twice. If both requests carry the same key, the server can recognize the second one as a replay of the first and hand back the original answer instead of doing the work again.\n\n## In practice\n\nStart with the column type. Cents, integer, with a constraint that says the impossible values are impossible.\n\n```sql\nprice integer NOT NULL CHECK (price > 0),   -- cents: $249.00 is 24900\ntotal integer NOT NULL CHECK (total > 0)\n```\n\nFormatting is the client's job. Your API returns `24900` and the app decides whether that reads as `$249.00` based on locale. Stripe expects the same unit, so there's no conversion layer to get wrong.\n\nNow the multi-step write. Creating an order means: verify the listing is available, insert the order, mark the listing sold, record the event. Four statements, all or nothing.\n\n```sql\nBEGIN;\n  INSERT INTO orders (buyer_id, listing_id, seller_id, total, status)\n  VALUES ($1, $2, $3, $4, 'pending');\n  UPDATE listings SET status = 'sold' WHERE id = $2;\n  INSERT INTO order_events (order_id, status) VALUES ($5, 'pending');\nCOMMIT;\n```\n\nIf the `UPDATE` fails after the `INSERT` succeeded, `COMMIT` never runs and Postgres discards all of it. Without the transaction you'd have an order pointing at a listing that is still for sale.\n\nThe transaction is not enough on its own. It stops half-writes, not races. Both buyers can run the full four-statement transaction concurrently and both can commit. That's what `FOR UPDATE` is for.\n\n```sql\nSELECT id, seller_id, price, status\n  FROM listings\n WHERE id = $1\n   FOR UPDATE;\n```\n\nRead that as \"give me this row and don't let anyone else take it until I'm done.\"\n\n| | Without the lock | With `FOR UPDATE` |\n|---|---|---|\n| t0 | A reads `active`, B reads `active` | A locks the row, reads `active`. B blocks at the counter. |\n| t1 | A writes `sold`. B writes `sold`. | A writes `sold`, commits, releases. |\n| t2 | Two orders exist. | B acquires the lock, reads `sold`, fails cleanly with a 409. |\n\nIn TypeScript with a query builder, the same thing:\n\n```ts\nawait db.transaction(async (tx) => {\n  const [listing] = await tx\n    .select()\n    .from(listings)\n    .where(eq(listings.id, listingId))\n    .for(\"update\");\n\n  if (!listing) throw new NotFoundError(\"Listing not found\");\n  if (listing.status !== \"active\") throw new ConflictError(\"Listing is no longer available\");\n\n  const [order] = await tx.insert(orders).values({ ... }).returning();\n  await tx.update(listings).set({ status: \"sold\" }).where(eq(listings.id, listingId));\n  await tx.insert(orderEvents).values({ orderId: order.id, status: \"pending\" });\n  return order;\n});\n```\n\nThe lock only exists inside the transaction. Outside one, `FOR UPDATE` takes the lock and releases it at the end of that single statement, which buys you nothing.\n\n**Isolation levels, briefly.** Postgres defaults to `READ COMMITTED`: each statement sees whatever was committed when that statement started, so two statements in one transaction can see different worlds. `REPEATABLE READ` pins a snapshot for the whole transaction. `SERIALIZABLE` behaves as if transactions ran one after another and aborts one when it can't. That's a real option for order creation, but only if your code catches the serialization failure and retries. An unhandled `40001` is a 500 to the user.\n\n**Deadlocks come from inconsistent lock order.** Transaction 1 locks listing A then B, transaction 2 locks B then A, both wait, and Postgres kills one. The fix is a rule rather than a retry: whenever you lock more than one row, always lock in the same deterministic order, such as ascending by id.\n\n**Idempotency keys** handle the double tap, which no amount of locking can fix, because the two requests are legitimately different requests.\n\n```sql\nCREATE TABLE idempotency_keys (\n  key         text PRIMARY KEY,\n  user_id     uuid NOT NULL,\n  order_id    uuid,\n  created_at  timestamptz NOT NULL DEFAULT now()\n);\n```\n\nThe client generates a UUID per user intent, one per tap of Buy and reused across retries of that tap, and sends it as an `Idempotency-Key` header. The server inserts the key inside the same transaction as the order. The second request's insert violates the primary key, so you return the already-created order instead of making a new one. The unique constraint is doing the thinking, not your `if` statement.\n\n## In your world\n\n`marketplace-api` puts all of this inside a Postgres function, `create_order()`, called via `supabase.rpc()` from `order.service.ts`. A plpgsql function body is already one transaction, which is why you won't find a `BEGIN` in it. Open the migration, find the `FOR UPDATE` line, and read the comment block above it. The event insert at the end of that function is the seed of the event-sourcing side quest.\n\nOn the work backend the same pattern is a Drizzle `db.transaction()` on the request-scoped handle rather than a Postgres function, which keeps the logic in TypeScript where you can test it. One rule carries across both: never hold a transaction open across a network call to a third party. `create_order` commits first, and only then does the service call Stripe. Flip that order and a slow Stripe response holds a row lock on your hottest table, so every other buyer queues behind an outage that isn't yours.\n\n## Watch out\n\n- `numeric` in Postgres is exact, so \"decimal has rounding errors\" isn't quite the real reason for cents. The real reasons are that JavaScript has no exact decimal type, so the value gets mangled the moment it enters your service, and that payment processors speak in the smallest unit anyway.\n- A transaction that stays open holds its locks. Do validation, HTTP calls, and image processing before you open it, not inside it.\n- `SELECT ... FOR UPDATE` blocks, and a request that can wait forever will, draining your connection pool. `NOWAIT` or a `lock_timeout` turns a contended row into a fast 409 instead of a slow hang.\n- `FOR UPDATE SKIP LOCKED` is the sibling for queue-like tables: it hands each worker a different unlocked row instead of making them queue for the same one.",
+      "tasks": [
+        "Open a Node REPL and run 0.1 + 0.2, 19.99 * 3, and 0.1 + 0.2 === 0.3. Write the three outputs into a comment at the top of your order service as the reason prices are integers.",
+        "Read the create_order() function in marketplace-api/supabase/migrations/001_create_marketplace_schema.sql and list its five steps in order, then say for each one what inconsistent state exists if the function stops right after it.",
+        "Reproduce the last-item race: comment out the FOR UPDATE clause, then fire two concurrent purchase requests at the same listing with `curl ... & curl ... & wait`. Confirm two orders exist. Restore FOR UPDATE and confirm the second request now fails with a clean error.",
+        "Open two psql sessions. In session A run BEGIN; SELECT ... FOR UPDATE on one listing. In session B run the same statement and watch it block. COMMIT in A and watch B unblock.",
+        "Add an idempotency_keys table and an Idempotency-Key header to POST /orders. Send the same key twice and assert you get the same order_id back both times, with only one row in orders.",
+        "Set lock_timeout to 2s in a session and prove that a contended FOR UPDATE returns an error instead of hanging forever.",
+        "Write a two-session deadlock on purpose: lock listing A then B in one session, B then A in the other. Read the deadlock error Postgres produces and name the rule that would have prevented it."
+      ],
+      "quiz": [
+        {
+          "q": "Why do production systems store money as an integer count of cents rather than a floating-point number?",
+          "options": [
+            "Integers use less disk space than decimals",
+            "JavaScript has no exact decimal type, so any float arithmetic in your service introduces error, and payment processors expect the smallest currency unit anyway",
+            "Postgres cannot store decimal values accurately",
+            "Integer columns can be indexed and decimal columns cannot"
+          ],
+          "answer": 1,
+          "explain": "Postgres `numeric` is actually exact. The problem is the trip through JavaScript, where every currency value becomes an IEEE 754 float, plus the fact that Stripe and every card network speak in cents. Integer cents keeps one representation end to end."
+        },
+        {
+          "q": "Two buyers race for the last item. You have already wrapped order creation in a transaction. What still goes wrong?",
+          "options": [
+            "Nothing, a transaction serializes the two requests",
+            "Both transactions can read status='active', both can commit, and you get two orders for one item",
+            "The second transaction will error because the first is still open",
+            "Postgres automatically retries the second transaction"
+          ],
+          "answer": 1,
+          "explain": "A transaction gives you all-or-nothing, not one-at-a-time. Under the default READ COMMITTED isolation, both transactions read the same 'active' status and both commit successfully. You need a row lock, SERIALIZABLE isolation, or a conditional update to break the tie."
+        },
+        {
+          "q": "A user on a flaky connection taps Buy twice and is charged twice. Which fix addresses this specific failure?",
+          "options": [
+            "SELECT ... FOR UPDATE on the listing row",
+            "Raising the isolation level to SERIALIZABLE",
+            "An idempotency key generated per user intent and enforced by a unique constraint",
+            "Wrapping the handler in a database transaction"
+          ],
+          "answer": 2,
+          "explain": "Locking and isolation coordinate concurrent requests for the same row, but these two requests are legitimately separate requests that both should succeed on their own. Only a client-supplied key that names the intent lets the server recognize the second as a replay of the first."
+        },
+        {
+          "q": "What causes a deadlock between two transactions?",
+          "options": [
+            "Holding a transaction open for more than a second",
+            "Two transactions acquiring the same locks in different orders, so each waits on a row the other holds",
+            "Using FOR UPDATE outside of a transaction",
+            "Too many connections in the pool"
+          ],
+          "answer": 1,
+          "explain": "Deadlock is a cycle in the wait-for graph. Transaction 1 locks A then wants B; transaction 2 locks B then wants A. Postgres detects it and kills one. The fix is a deterministic lock order, such as always locking rows ascending by id."
+        },
+        {
+          "q": "Why should you call Stripe after the order transaction commits rather than inside it?",
+          "options": [
+            "Stripe's SDK cannot run inside a database transaction",
+            "An open transaction holds its row locks for the entire duration of the HTTP call, so a slow third party blocks every other buyer on that row",
+            "The PaymentIntent needs an order id that only exists after commit",
+            "Transactions cannot be rolled back once an HTTP request has been made"
+          ],
+          "answer": 1,
+          "explain": "Locks live as long as the transaction. Awaiting a network call inside one means someone else's latency, or outage, becomes contention on your hottest table. Do all external I/O outside the transaction boundary."
+        }
+      ],
+      "resources": [
+        {
+          "label": "PostgreSQL: Explicit Locking (FOR UPDATE, lock modes, deadlocks)",
+          "url": "https://www.postgresql.org/docs/current/explicit-locking.html"
+        },
+        {
+          "label": "PostgreSQL: Transaction Isolation",
+          "url": "https://www.postgresql.org/docs/current/transaction-iso.html"
+        },
+        {
+          "label": "Stripe: Idempotent requests",
+          "url": "https://docs.stripe.com/api/idempotent_requests"
+        },
+        {
+          "label": "Supabase: Row Level Security & database access patterns",
+          "url": "https://supabase.com/docs/guides/database/postgres/row-level-security"
+        }
+      ]
+    },
+    "m4-2": {
+      "content": "## The problem\n\nA user types `chairs` into your search bar and gets nothing. You have forty chairs. Every one of them is titled \"chair\". Your query is `WHERE title ILIKE '%chairs%'`, and \"chair\" does not contain the substring \"chairs\".\n\nShe tries again with `vintage leather bag`. Now she gets 180 results ordered by `created_at DESC`, and the listing literally titled \"Vintage Leather Bag\" sits around position 60 because it was posted in March. She scrolls twice and leaves.\n\nMeanwhile the endpoint's p95 has drifted from 30ms at launch to 900ms today, and nobody changed the code. `ILIKE '%term%'` cannot use a B-tree index, because an index is sorted by prefix and you gave it a wildcard prefix. So Postgres reads every row and compares every value. The query didn't get slower. Your table got bigger, and the query was always O(n).\n\n## The idea\n\nFull-text search is what a textbook index does, versus what you do when you skim every page looking for a word.\n\nTo build that index, Postgres first normalizes the text into a `tsvector`: it splits words, drops the ones that carry no signal, and reduces the rest to a root form.\n\n```sql\nSELECT to_tsvector('english', 'The quick brown foxes were running');\n-- 'brown':3 'fox':4 'quick':2 'run':6\n```\n\n\"The\" and \"were\" are gone as stop words, too common to narrow anything down. \"foxes\" became \"fox\" and \"running\" became \"run\". That reduction is **stemming**, and it's the reason `chairs` will now find `chair`. Each surviving word keeps its position, which is later used to judge how close together your terms appeared.\n\nYour search string goes through the exact same grinder to become a `tsquery`, which is why the two sides meet in the middle:\n\n```sql\nSELECT websearch_to_tsquery('english', 'running foxes');\n-- 'run' & 'fox'\n```\n\nThen a **GIN index** makes the lookup fast. GIN is an inverted index: instead of row-to-words, it stores word-to-rows.\n\n```\n'vintag'  -> [5, 23, 891]\n'leather' -> [5, 44, 891, 1002]\n```\n\nSearching `vintag & leather` is two lookups and a set intersection. The cost tracks matching rows, not total rows. That's the difference between a search bar that survives growth and one that quietly rots.\n\n## In practice\n\nStore the vector as a generated column so it can never drift from the text it describes.\n\n```sql\nALTER TABLE listings ADD COLUMN search_vector tsvector\n  GENERATED ALWAYS AS (\n    setweight(to_tsvector('english', coalesce(title, '')), 'A') ||\n    setweight(to_tsvector('english', coalesce(description, '')), 'B')\n  ) STORED;\n\nCREATE INDEX listings_search_idx ON listings USING GIN (search_vector);\n```\n\n`setweight` is the whole ranking story in one function. Weights run A (highest) through D, and the combined vector remembers which weight each word came from. A listing titled \"Vintage Leather Bag\" with a description about condition will outrank one titled \"Great Bag\" whose description happens to mention vintage leather. `||` concatenates the two vectors and keeps both sets of weights.\n\nThe generated column is the modern default. `marketplace-api` uses a `BEFORE INSERT OR UPDATE OF title, description` trigger instead, which is what you need when the expression isn't `IMMUTABLE`, or when you want the vector to include data from another table. Note the `OF title, description` in that trigger: without it, updating the price would recompute the search vector for no reason.\n\nMatching uses `@@`, and ranking uses `ts_rank_cd`.\n\n```sql\nSELECT l.id, l.title, ts_rank_cd(l.search_vector, q) AS rank\n  FROM listings l, websearch_to_tsquery('english', $1) AS q\n WHERE l.search_vector @@ q\n   AND l.status = 'active'\n ORDER BY rank DESC, l.created_at DESC\n LIMIT 20;\n```\n\n`ts_rank_cd` is cover-density ranking: it rewards terms that appear often, in high-weight fields, and close to each other. `ORDER BY rank DESC, created_at DESC` gives you a deterministic tiebreak, which matters the moment you paginate.\n\nWhich query builder you use changes the user experience more than you'd guess:\n\n| Function | Input | Produces |\n|---|---|---|\n| `plainto_tsquery` | `quick fox` | `'quick' & 'fox'` |\n| `phraseto_tsquery` | `quick fox` | `'quick' <-> 'fox'` (adjacent) |\n| `websearch_to_tsquery` | `\"quick fox\" -brown` | `'quick' <-> 'fox' & !'brown'` |\n| `to_tsquery` | `quick & fox` | requires you to write the operators |\n\n`websearch_to_tsquery` is the one to reach for on a public search bar, because it accepts what people actually type: quoted phrases, a leading minus to exclude, stray punctuation. `to_tsquery` throws a syntax error on a user typing an apostrophe, which becomes a 500 in your logs.\n\nThen prove the index is being used.\n\n```sql\nEXPLAIN ANALYZE\nSELECT id FROM listings WHERE search_vector @@ websearch_to_tsquery('english', 'vintage leather');\n```\n\nYou want to see `Bitmap Index Scan on listings_search_idx`. If you see `Seq Scan on listings`, either the index is missing, or the text search configuration in the query doesn't match the one in the column, or your table is small enough that Postgres correctly decided scanning it is cheaper. Add a few thousand rows before you trust the plan.\n\n## In your world\n\nIn `marketplace-api`, migration `001` creates the vector and the GIN index, and migration `002` wraps the query in a `search_listings()` function so relevance ranking, price filters, and cursor pagination can live in one place. Read why it exists: the client-side query builder can't order by a rank score it never computed. `listing.service.ts` calls it through `supabase.rpc()` and wraps the whole thing in a cache, which is tomorrow's module.\n\n`project-tracker-api` does the same thing with one extra move worth stealing: it weights the issue `key` at A alongside the title, so typing `PROJ-42` finds the issue directly and typing `login crash` finds it by description. Search that mixes an identifier and prose in one input is exactly what your users expect from Linear and Jira. On the work backend, this is the machinery behind searching posts and profiles, and the reason nobody has needed to stand up a search cluster.\n\nWhich brings up the honest answer on Elasticsearch and Typesense: you probably won't need them for years. Postgres full-text search comfortably handles millions of rows with sub-50ms queries. You graduate when you need typo tolerance and instant type-ahead as product features, faceted aggregation across many fields at once, cross-language analyzers, or per-user relevance tuning. Those are real reasons. \"It feels more serious\" is not, and an external index is a second copy of your data that can silently drift.\n\n## Watch out\n\n- The text search configuration must match on both sides. A column built with `'english'` and a query built with `'simple'` will miss stemmed matches with no error to tell you why.\n- An index on the column does not help a query that computes the vector inline. `WHERE to_tsvector('english', title) @@ q` needs an expression index on that exact expression, or it's a sequential scan.\n- Full-text search matches words, not substrings, and has no typo tolerance. For those, the tool is the `pg_trgm` extension and a trigram index. Different problems, and you can have both.\n- Stemming mangles identifiers. SKUs, model numbers, and slugs get chopped in ways nobody expects, so keep exact-match lookups on their own indexed column rather than hoping the analyzer cooperates.",
+      "tasks": [
+        "Run `SELECT to_tsvector('english', 'The quick brown foxes were running');` and account for every difference between the input and the output: which words vanished, which changed, and what the numbers mean.",
+        "Compare all four query builders on the same user input: plainto_tsquery, phraseto_tsquery, websearch_to_tsquery, and to_tsquery with the string `vintage leather -broken`. Note which one throws.",
+        "Add a generated tsvector column plus a GIN index to a scratch table, with title weighted A and description weighted B. Insert two rows that invert which field holds which word, then confirm ts_rank_cd orders them the way you predicted.",
+        "Seed 50,000 listings, then run EXPLAIN ANALYZE for the same search using ILIKE '%chair%' and using the GIN index. Record both execution times and both node types.",
+        "Break the search on purpose: query with `simple` against a column built with `english` and find a search term where the two disagree.",
+        "Read marketplace-api/supabase/migrations/002_search_function.sql and write down why the search lives in a Postgres function instead of the Supabase query builder.",
+        "Install pg_trgm on a scratch database and get a typo query ('lether bag') to return results. Then write one sentence on when you would use trigram search instead of full-text search."
+      ],
+      "quiz": [
+        {
+          "q": "A user searches 'chairs' and your ILIKE query misses every listing titled 'chair'. What makes full-text search find it?",
+          "options": [
+            "The GIN index performs fuzzy substring matching",
+            "Both the document and the query are stemmed to a root form, so 'chairs' and 'chair' both become 'chair'",
+            "tsvector stores every possible substring of each word",
+            "Postgres automatically appends a wildcard to search terms"
+          ],
+          "answer": 1,
+          "explain": "Stemming happens on both sides: to_tsvector reduces stored text to roots, and the tsquery builder reduces the search string the same way. They meet in the middle. Nothing about it is fuzzy, which is why typos still miss."
+        },
+        {
+          "q": "What does a GIN index actually store?",
+          "options": [
+            "A sorted copy of the text column for binary search",
+            "A mapping from each word to the set of rows containing it, so a search is a lookup plus a set intersection",
+            "A hash of each full column value",
+            "The tsvector for each row, in row order"
+          ],
+          "answer": 1,
+          "explain": "GIN is an inverted index: word to row-ids rather than row to words. Searching two terms means two lookups and an intersection, so cost tracks the number of matching rows rather than the size of the table."
+        },
+        {
+          "q": "What does setweight(..., 'A') on the title and 'B' on the description accomplish?",
+          "options": [
+            "It searches the title first and only falls back to the description",
+            "It stores the two fields in separate indexes",
+            "It labels each word with the field it came from so ts_rank scores title matches higher than description matches",
+            "It gives the title priority when two listings have identical text"
+          ],
+          "answer": 2,
+          "explain": "The concatenated tsvector remembers which weight each lexeme carried. Ranking functions then score a title hit above a description hit, which is why a listing actually named 'Vintage Leather Bag' outranks one that merely mentions the words."
+        },
+        {
+          "q": "You have a GIN index on the search_vector column, but `WHERE to_tsvector('english', title) @@ q` still shows a Seq Scan. Why?",
+          "options": [
+            "GIN indexes only work with plainto_tsquery",
+            "The index covers the search_vector column, not that computed expression, so it cannot be used",
+            "The query is missing an ORDER BY, which GIN requires",
+            "Seq Scan is always used when the table has fewer than a million rows"
+          ],
+          "answer": 1,
+          "explain": "An index applies to exactly the column or expression it was built on. Query the stored column, or create an expression index on the identical expression. This is one of the most common reasons a full-text search 'has an index' and is still slow."
+        },
+        {
+          "q": "When is Postgres full-text search genuinely not enough?",
+          "options": [
+            "Once the table passes about 100,000 rows",
+            "As soon as you need to rank results by relevance",
+            "When you need typo tolerance and instant type-ahead as product features, faceted aggregation across many fields, or per-user relevance tuning",
+            "Whenever search results must be paginated"
+          ],
+          "answer": 2,
+          "explain": "Postgres handles millions of rows with ranked, filtered, paginated search. You graduate to a dedicated engine for fuzzy matching, heavy faceting, multi-language analyzers, or tunable relevance, and you accept a second copy of your data that can drift."
+        }
+      ],
+      "resources": [
+        {
+          "label": "PostgreSQL: Full Text Search",
+          "url": "https://www.postgresql.org/docs/current/textsearch.html"
+        },
+        {
+          "label": "PostgreSQL: Controlling Text Search (ranking, setweight)",
+          "url": "https://www.postgresql.org/docs/current/textsearch-controls.html"
+        },
+        {
+          "label": "PostgreSQL: GIN Indexes",
+          "url": "https://www.postgresql.org/docs/current/gin.html"
+        },
+        {
+          "label": "Supabase: Full text search guide",
+          "url": "https://supabase.com/docs/guides/database/full-text-search"
+        }
+      ]
+    },
+    "m4-3": {
+      "content": "## The problem\n\nThe listings feed endpoint is fine. 40ms, indexes in place, you checked the plan. At 100 requests per minute it doesn't register on any graph.\n\nThen someone posts the app in a large group chat and you get 10,000 requests per minute for twenty minutes. The endpoint is now 8 seconds at p99, Postgres CPU is pinned, and the connection pool is exhausted. The part that hurts is what else breaks: checkout runs against the same database, so buyers mid-purchase get timeouts too. One popular read query took down writes that had nothing to do with it.\n\nNothing was wrong with the query. It was asked the same question 10,000 times and computed the answer from scratch every time.\n\n## The idea\n\nYou already ship this pattern. When your app renders a profile screen, you don't refetch the avatar on every scroll. You keep it in an image cache, serve from memory, and accept that if someone changes their photo you might show the old one for a bit. You made a deliberate trade: a little staleness for a lot of speed.\n\nCache-aside is that trade, written on the server:\n\n1. Look in the cache for this key.\n2. Hit? Return it. Done, no database involved.\n3. Miss? Run the real query.\n4. Write the result into the cache with a TTL.\n5. Return it.\n\nThe TTL is not a performance knob. It's a **correctness knob**: it is you stating, in seconds, how wrong you are willing to be. A 120-second TTL on search results means \"a new listing may take up to two minutes to appear, and that's acceptable.\" A 120-second TTL on an account balance means something very different.\n\nTwo hard problems come attached, and both will find you.\n\n## In practice\n\nThe helper is small enough to hold in your head, which is the point.\n\n```ts\nexport async function cachedListings(key: string, ttlSeconds: number, load: () => Promise<Listing[]>) {\n  try {\n    const hit = await redis.get(key);\n    if (hit) return JSON.parse(hit) as Listing[];\n  } catch (err: unknown) {\n    logger.warn({ key, err }, \"cache read failed, falling through to db\");\n  }\n\n  const data = await load();\n\n  try {\n    await redis.set(key, JSON.stringify(data), \"EX\", ttlSeconds);\n  } catch (err: unknown) {\n    logger.warn({ key, err }, \"cache write failed\");\n  }\n\n  return data;\n}\n```\n\nNote what the `try/catch` blocks buy you. If Redis is down, every call falls through to the database. The app is slower and still correct. **Cache is an optimization, never the source of truth.** The day you write code that returns an error because the cache was unavailable, you have turned a performance layer into a new single point of failure.\n\n**Cache keys.** A key must encode every input that changes the answer. Query text, filters, sort order, page cursor, page size.\n\n```ts\nconst key = `search:${JSON.stringify({ q, categoryId, minPrice, maxPrice, sortBy, cursor, limit })}`;\n```\n\nAnd if the result depends on who's asking, the key must include the asker. Leave `userId` out of a key for a personalized response and you have built a machine that serves one user's data to another. That is not a caching bug, it's a data breach with a TTL.\n\n**Problem one: invalidation.** A seller edits a listing title. The database is correct immediately. The cache is not. Three ways out:\n\n- **Let the TTL expire.** Simple, and stale for up to TTL seconds.\n- **Delete the key on write.** Immediate, and you must remember every key the change affects.\n- **Write-through:** update the cache as part of the write. Always fresh, and now your write path fails when Redis does, so you've coupled correctness to the cache again.\n\nCache-aside plus targeted invalidation is the usual answer.\n\n```ts\nawait invalidateCache(`listing:${listingId}`);   // the detail view\nawait invalidateCache(\"search:*\");              // every search result that might contain it\n```\n\nThat wildcard deserves a warning. Use `SCAN`, never `KEYS`. Redis is single-threaded: `KEYS` walks the entire keyspace in one blocking operation, and with millions of keys it freezes every other client for seconds. `SCAN` returns a cursor and works in batches, yielding in between.\n\n```ts\nlet cursor = \"0\";\ndo {\n  const [next, keys] = await redis.scan(cursor, \"MATCH\", pattern, \"COUNT\", 100);\n  cursor = next;\n  if (keys.length > 0) await redis.del(...keys);\n} while (cursor !== \"0\");\n```\n\n**Problem two: stampede.** Your hot key has a 120-second TTL. At second 120 it expires. In that instant, 500 in-flight requests all miss, all run the expensive query, and all write the same value back. You built a cache and it produced a synchronized thundering herd against your database, on a schedule.\n\nThree mitigations, in increasing order of effort:\n\n- **Jitter the TTL.** `120 + Math.floor(Math.random() * 30)` spreads expiry across a window instead of a single tick. Nearly free, fixes most of it.\n- **Single-flight.** The first miss takes a short Redis lock (`SET key:lock 1 NX EX 10`) and does the work; the others wait briefly and re-read. One query per expiry instead of 500.\n- **Stale-while-revalidate.** Store the value with a longer TTL plus an embedded \"soft expiry\" timestamp. Past soft expiry, serve the stale value immediately and refresh in the background. Users never wait on a cold cache.\n\nPick TTLs by how much staleness the screen tolerates, not by round numbers:\n\n| Data | TTL | Reasoning |\n|---|---|---|\n| Search results | 120s | New listings appearing two minutes late is invisible |\n| Listing detail | 300s, invalidated on write | Rarely changes, but must be right after an edit |\n| Seller dashboard stats | 600s | Aggregate, nobody expects it live |\n| Anything about money owed | no cache | Read it from the source |\n\n## In your world\n\n`marketplace-api/src/config/redis.ts` is exactly this: a `cached()` helper and an `invalidateCache()` that uses `SCAN`. Look at where `listing.service.ts` calls them. `createListing` and `updateListing` both blow away `search:*`, and `updateListing` also drops `listing:{id}`. Now go find the gap: which write paths change data that ends up in a cached search result but don't invalidate anything? An order marking a listing sold is a good place to start looking. That gap is the trap below, and finding it yourself is worth more than reading about it.\n\nYour work backend takes the other road for the feed: instead of caching an expensive query on read, a job precomputes and stores feed rows on write, so reads are already cheap. Same trade, cost moved to write time, and it's why feed jobs exist as a separate process. The vocabulary transfers directly. TTL, invalidation, and stampede are three of the things you will discuss in every scaling conversation from here on.\n\n## Watch out\n\n- Caching a personalized response under a key that omits the user is the worst bug in this module. Write the user id into the key or don't cache the endpoint.\n- Order matters on writes. Invalidate *after* the database commits. Invalidate first and a concurrent reader can repopulate the cache with the old value in the window between.\n- Don't cache failures. An error or empty result stored for 300 seconds turns a two-second blip into a five-minute outage.\n- A cache with no TTL is a memory leak with opinions, and one running at a 20% hit rate is adding a network round trip to 80% of requests while feeling productive. Always set an expiry, and always measure the hit rate.",
+      "tasks": [
+        "Wrap GET /listings/:id in a cache-aside helper with a 300 second TTL. Log HIT and MISS, then hit the endpoint twice and confirm the second request never reaches Postgres.",
+        "Build the search cache key from every parameter that changes the result, then prove it: two searches that differ only in sort order must produce two different keys and two different results.",
+        "Deliberately write a cache key for a personalized endpoint that omits the user id, log in as two users, and watch one user receive the other's data. Then fix it and write down what class of bug you just created.",
+        "Implement invalidateCache with SCAN. Then implement it with KEYS, load 200,000 dummy keys, and time both while a second client issues PINGs so you can see Redis block.",
+        "Simulate a stampede: set a 10 second TTL on an expensive query, fire 200 concurrent requests with a load tool, and count how many reach the database in the second after expiry. Add TTL jitter and count again.",
+        "Kill Redis while the server is running and confirm every endpoint still returns correct data, only slower. If anything 500s, fix it until nothing does.",
+        "Instrument hit rate as a counter and report it for each cached key prefix after browsing the app for five minutes. Delete any cache running below 30 percent."
+      ],
+      "quiz": [
+        {
+          "q": "The most accurate way to describe a cache TTL is:",
+          "options": [
+            "A performance setting that trades memory for speed",
+            "A correctness setting: it is you declaring, in seconds, how stale you are willing to be",
+            "A safety limit that prevents Redis from running out of memory",
+            "A retry interval for failed cache writes"
+          ],
+          "answer": 1,
+          "explain": "Every TTL is a statement about tolerable wrongness. Two minutes on search results is invisible; two minutes on a balance is a support ticket. Choosing TTLs per data type, by staleness tolerance, is the actual skill."
+        },
+        {
+          "q": "Redis is down. What should your API do?",
+          "options": [
+            "Return 503 so clients know the system is degraded",
+            "Fall through to the database on every request: slower, still correct",
+            "Serve the last known values from process memory",
+            "Retry the Redis connection until it succeeds"
+          ],
+          "answer": 1,
+          "explain": "Cache is an optimization, never the source of truth. Wrap reads and writes in try/catch, log a warning, and continue to the database. The moment a cache outage becomes an API outage, you have added a single point of failure instead of removing one."
+        },
+        {
+          "q": "A hot key expires and 500 concurrent requests all miss at once, all running the same expensive query. What is the cheapest effective mitigation?",
+          "options": [
+            "Switch to write-through caching",
+            "Increase the TTL to an hour",
+            "Add random jitter to the TTL so expiry spreads across a window instead of one instant",
+            "Move the query to a background job"
+          ],
+          "answer": 2,
+          "explain": "Jitter costs one line and breaks the synchronization that makes a stampede. Single-flight locking and stale-while-revalidate are stronger, but start with jitter because it removes most of the herd for almost no complexity."
+        },
+        {
+          "q": "Which cache mistake is a security problem rather than a performance problem?",
+          "options": [
+            "Using KEYS instead of SCAN for invalidation",
+            "Caching a personalized response under a key that omits the user id",
+            "Setting a TTL longer than the data's update frequency",
+            "Caching an empty result set"
+          ],
+          "answer": 1,
+          "explain": "A key that omits the identity of the requester will serve the first user's data to the second. It is cross-user data disclosure with a TTL attached, and no error is raised. Personalized responses must include the user id in the key or not be cached."
+        },
+        {
+          "q": "When should you invalidate a cache key relative to the database write?",
+          "options": [
+            "Before the write, so no reader can see the old value",
+            "After the write commits, because invalidating first lets a concurrent reader repopulate the cache with the old value",
+            "It makes no difference as long as both happen",
+            "In the same Redis transaction as the write"
+          ],
+          "answer": 1,
+          "explain": "Delete first and a reader can miss, query the not-yet-updated row, and write the stale value back with a fresh TTL. You have now cached the old data for a full TTL immediately after an edit. Invalidate after commit."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Redis: SCAN (cursor-based iteration, and why not KEYS)",
+          "url": "https://redis.io/docs/latest/commands/scan/"
+        },
+        {
+          "label": "Redis: EXPIRE and key TTLs",
+          "url": "https://redis.io/docs/latest/commands/expire/"
+        },
+        {
+          "label": "roadmap.sh: Backend Performance Best Practices",
+          "url": "https://roadmap.sh/best-practices/backend-performance"
+        }
+      ],
+      "trap": {
+        "title": "The five-minute-old name",
+        "content": "Ship the cache first. Get `GET /listings/:id` returning from Redis with a 300-second TTL and confirm you see `Cache HIT` in the logs on the second request.\n\nNow break it on purpose, the way production breaks it. Do **not** call your own update endpoint. Instead, change the row from somewhere that doesn't run your invalidation code, which is exactly how it happens for real:\n\n```sql\nUPDATE listings SET title = 'Vintage Leather Bag (PRICE DROP)' WHERE id = '...';\n```\n\nThen start a timer and poll:\n\n```bash\nwhile true; do\n  curl -s http://localhost:3003/listings/THE_ID | jq -r '.title'\n  sleep 10\ndone\n```\n\nWrite down the wall-clock time until the new title appears. Don't estimate it. Measure it, and keep the number.\n\nNow sit with the second half, which is the part that actually matters. Answer these out loud before you fix anything:\n\n- A user edits their listing through a path that skips invalidation, refreshes, and sees the old title. What do they conclude? They conclude your save button is broken, and that is the bug title you will receive.\n- How would you have found this without already knowing? Not from an error, because there is no error. Not from Sentry, because nothing threw. Not from latency graphs, because the stale response is the *fast* one. A cache staleness bug is invisible to every alarm you own.\n- What is the smallest thing that would have caught it? Usually one integration test: write through the real service, read through the real endpoint, assert the new value comes back. That test fails the instant a write path forgets to invalidate.\n\nThen fix it two ways and compare. First shorten the TTL to 10 seconds and watch the problem shrink without disappearing. Second, add the missing invalidation and put the TTL back. Notice that only one of those is a fix, and the other is a smaller version of the same bug. You now have a real answer to \"shorten the TTL or fix invalidation\", and it's an answer you earned rather than memorized."
+      }
+    },
+    "m4-4": {
+      "content": "## The problem\n\nA ticket lands: \"the orders screen is slow.\" Your dashboard agrees. `GET /orders` is 180ms at p50 and 4.1 seconds at p99. So one request in a hundred is unusable, and you have no idea which part of it is slow.\n\nThe endpoint is thirty lines of TypeScript with one obvious database call in it. Except when you turn on query logging, that single request fired 51 queries: one to list the orders, and one per order to fetch the listing title so the row can render. Twenty rows on your dev machine is 21 fast queries and feels fine. A power seller with 200 orders is 201 round trips, each paying network latency that your local Postgres on a unix socket never charged you.\n\nTwo skills fix this: reading a query plan honestly, and recognizing the shapes that go wrong.\n\n## The idea\n\n`EXPLAIN` asks Postgres what it *intends* to do. `EXPLAIN ANALYZE` makes it run the query and report what happened. The difference between those two outputs is where most answers live.\n\nIt's the flame chart you already read in React DevTools: a tree of nodes, each reporting its own cost and the rows it produced, children feeding parents. Read it inside-out, since the deepest, most indented nodes run first and hand their rows up.\n\n```sql\nEXPLAIN (ANALYZE, BUFFERS)\nSELECT o.id, o.total, l.title\n  FROM orders o\n  JOIN listings l ON l.id = o.listing_id\n WHERE o.seller_id = $1\n ORDER BY o.created_at DESC\n LIMIT 20;\n```\n\nThree numbers per node matter more than the rest:\n\n- **`rows=`** is the planner's estimate. **`actual rows=`** is the truth. A big gap means the planner chose its strategy on bad information.\n- **`actual time=A..B`** is start and end time per loop, in milliseconds. Multiply by **`loops=`** to get real total cost. A node that takes 0.8ms but runs 200 times is 160ms.\n- **`Buffers: shared hit=... read=...`** tells you what came from memory versus disk. `read` is where your seconds hide.\n\n## In practice\n\n**Access methods, and what each one is telling you.**\n\n| Node | Meaning | Verdict |\n|---|---|---|\n| `Seq Scan` | Read every row | Fine on a small or unfiltered table. A red flag with a selective `WHERE`. |\n| `Index Scan` | Walk the index, fetch matching rows from the heap | What you usually want |\n| `Index Only Scan` | Answer entirely from the index, never touch the table | Best case. Means the index covers every column you selected. |\n| `Bitmap Index Scan` + `Bitmap Heap Scan` | Collect matching row locations, sort them, then read the table in physical order | Normal for medium selectivity and for GIN indexes |\n| `Rows Removed by Filter: 50000` | The index got you close, then Postgres threw most of it away | Your index is missing a column the query filters on |\n\n**Join strategies.** `Nested Loop` runs the inner side once per outer row: excellent when the outer side yields a handful of rows, catastrophic at ten thousand. `Hash Join` builds a hash table from the smaller side and streams the larger past it, which is the right choice for big-to-big. `Merge Join` needs both sides sorted and is cheap when they already are.\n\nYou rarely pick these. Postgres picks, based on estimated row counts, so a `Nested Loop` running 40,000 loops is usually not a join bug. It's an **estimation** bug, and the estimate is the thing to fix.\n\n```\n->  Nested Loop  (cost=0.42..85.31 rows=12 width=48)\n                 (actual time=0.03..920.11 rows=41822 loops=1)\n```\n\nEstimated 12, got 41,822. Postgres chose nested loop because 12 loops is nothing, then did it 41,822 times. Causes, in the order to check them: stale statistics, so run `ANALYZE orders`; correlated predicates, where `WHERE city = 'Chennai' AND state = 'TN'` looks like two independent filters to the planner and isn't, fixed with `CREATE STATISTICS`; or a function in the `WHERE` clause the planner cannot estimate through.\n\n**`Sort Method`** is worth one glance every time. `quicksort Memory: 256kB` is in-memory. `external merge Disk: 48MB` means the sort spilled to disk, so you're paying I/O to order rows, usually fixable with an index matching the `ORDER BY`.\n\n**Partial indexes** index only the rows you actually query.\n\n```sql\nCREATE INDEX listings_active_price_idx ON listings (price) WHERE status = 'active';\nCREATE INDEX notifications_unread_idx  ON notifications (user_id, created_at DESC) WHERE is_read = false;\n```\n\nOne million listings with 100,000 active gives you an index a tenth the size, far likelier to stay in memory. The unread-notifications one is sharper: a user with 10,000 read and 5 unread notifications has an index containing 5 rows, and the badge-count query that runs on every screen becomes free. Postgres uses a partial index automatically when the query's `WHERE` implies the index predicate, and ignores it when it doesn't, so `WHERE status = 'sold' AND price > 1000` gets nothing from the first index.\n\n**Covering indexes** let a query finish inside the index.\n\n```sql\nCREATE INDEX orders_seller_recent_idx\n  ON orders (seller_id, created_at DESC) INCLUDE (total, status);\n```\n\n`seller_id, created_at DESC` handles both the filter and the sort. `INCLUDE` carries `total` and `status` along without making them part of the sort key, so a query selecting only those four columns reports `Index Only Scan` and never visits the table.\n\n**The N+1 problem** is your 51 queries. In an API it appears the same way every time: a list query, then a loop that fetches something per item.\n\n```ts\n// N+1: one query, then one more per row\nconst orders = await getOrders(sellerId);\nfor (const order of orders) {\n  order.listing = await getListing(order.listing_id);\n}\n```\n\nTwo fixes. Join in the database and let it return the shape you need in one round trip:\n\n```ts\nconst rows = await db\n  .select({ id: orders.id, total: orders.total, title: listings.title })\n  .from(orders)\n  .innerJoin(listings, eq(listings.id, orders.listingId))\n  .where(eq(orders.sellerId, sellerId));\n```\n\nOr, when a join won't fit, batch the second query: collect the ids and issue one `WHERE listing_id = ANY($1)`. Two queries instead of 201.\n\n**Denormalization** is the deliberate version of the same trade. `orders.seller_id` is already reachable by joining through `listings`, and `marketplace-api` stores it on the order anyway, because \"all orders for this seller\" is one of the hottest queries in the product and this turns a join into one index scan.\n\nState the cost out loud, in the migration comment: *if a listing ever changes seller, existing orders keep the old seller_id.* For a completed order that's not a bug, it's a historical fact you want frozen. Denormalize when the source data is immutable and the join is hot. Never denormalize a value that changes often, because you have created two truths and no mechanism to keep them equal.\n\n## In your world\n\nBoth projects have partial indexes waiting for you: three on `WHERE status = 'active'` in `marketplace-api`, and the unread-notifications one in `project-tracker-api`. Run `EXPLAIN ANALYZE` on the queries they serve, then drop one index inside a transaction, re-run, and `ROLLBACK`. Seeing `Seq Scan` and a 40x time difference on the same query, with your own eyes, is what makes indexes stop being folklore.\n\nThen go hunting for an N+1 in your own code. The list screens in `project-tracker-api` are the place: an issues list rendering assignee names, a board view rendering columns and cards. On the work backend, feed and comment endpoints are where this breeds, because a feed row needs an author, a like count, and a comment preview, and each is a tempting little extra query. Turn on query logging, load one screen, count the lines. The count is the whole argument.\n\n## Watch out\n\n- `EXPLAIN ANALYZE` on an `UPDATE` or `DELETE` executes it. Wrap it: `BEGIN; EXPLAIN ANALYZE UPDATE ...; ROLLBACK;`\n- Plans depend on data volume. A query that uses an index on 50 seeded rows may sequentially scan the same table at a million, and vice versa. Test plans against realistic data or you're reading fiction.\n- Every index slows every write to that table and costs disk, and an index on a low-selectivity column earns nothing at all. `pg_stat_user_indexes` tells you which ones nobody reads.\n- Wrapping a column in a function hides it from its index, so `WHERE lower(email) = $1` needs an index on `lower(email)`. Likewise `ORDER BY x DESC LIMIT 20` only skips the sort when an index provides that exact order.",
+      "tasks": [
+        "Run EXPLAIN (ANALYZE, BUFFERS) on the slowest query in marketplace-api and annotate the output line by line: node type, estimated rows, actual rows, actual time times loops.",
+        "Find a node where estimated and actual rows differ by more than 10x. Run ANALYZE on the table, re-run the plan, and record whether the estimate and the chosen join strategy changed.",
+        "Drop one of the partial indexes inside BEGIN, run EXPLAIN ANALYZE on the query it served, then ROLLBACK. Write down the node type and time with and without it.",
+        "Create a covering index using INCLUDE and get a real query to report Index Only Scan. Then add one more column to the SELECT list and watch it stop.",
+        "Turn on statement logging locally, load one list screen in project-tracker-api, and count the queries. If the count scales with the number of rows, rewrite it as a join or a single ANY($1) batch and count again.",
+        "Force a disk sort by ordering a large result set on an unindexed column, find 'external merge Disk' in the plan, then add the matching index and confirm the sort disappears.",
+        "Query pg_stat_user_indexes for indexes with zero scans and write a one-line justification for keeping or dropping each one."
+      ],
+      "quiz": [
+        {
+          "q": "A plan node shows `rows=12 ... actual rows=41822`. What does that gap tell you?",
+          "options": [
+            "The query returned the wrong results",
+            "The planner chose its strategy on bad information, usually stale statistics or correlated predicates it cannot estimate",
+            "The index is corrupt and needs a REINDEX",
+            "Postgres ran the node 41822 times"
+          ],
+          "answer": 1,
+          "explain": "A large estimate-versus-actual divergence is the single highest-signal thing in a plan. The planner picked nested loop because 12 iterations is free; it then ran 41,822 of them. Fix the estimate with ANALYZE or CREATE STATISTICS rather than fighting the join type."
+        },
+        {
+          "q": "What does `Index Only Scan` mean?",
+          "options": [
+            "Only one index was used in the query",
+            "The query was answered entirely from the index without visiting the table, because the index carries every column selected",
+            "The index was scanned but no rows matched",
+            "Postgres scanned the index instead of using it for lookups"
+          ],
+          "answer": 1,
+          "explain": "It is the best case: no heap access at all. You get it when the index covers every column the query touches, which is what INCLUDE is for — extra payload columns without adding them to the sort key."
+        },
+        {
+          "q": "Which is the strongest candidate for a partial index?",
+          "options": [
+            "A boolean column where roughly half the rows are true",
+            "notifications(user_id, created_at DESC) WHERE is_read = false, for the unread badge count",
+            "The primary key column of a large table",
+            "A text column used with ILIKE '%term%'"
+          ],
+          "answer": 1,
+          "explain": "Partial indexes win when queries filter on a value that covers a small minority of rows. A user with 10,000 read and 5 unread notifications gets an index holding 5 rows for a query that runs on every screen. A 50/50 boolean gets you nothing."
+        },
+        {
+          "q": "How does the N+1 problem show up in an API endpoint?",
+          "options": [
+            "One query that joins too many tables at once",
+            "A list query followed by one extra query per returned row, so the count grows with the result set",
+            "A query that returns one more row than the requested limit",
+            "A transaction that opens and closes N times"
+          ],
+          "answer": 1,
+          "explain": "It hides well because the code has one obvious database call plus an innocent loop. Twenty rows feels fine locally; two hundred rows in production is 201 round trips. Fix it with a join, or by batching the second query with ANY($1)."
+        },
+        {
+          "q": "What is the danger of running EXPLAIN ANALYZE on an UPDATE statement?",
+          "options": [
+            "It locks the table for the duration of the plan",
+            "ANALYZE executes the statement for real, so the rows are actually updated",
+            "It reports estimated rather than actual timings for writes",
+            "It cannot be used with write statements at all"
+          ],
+          "answer": 1,
+          "explain": "EXPLAIN alone only plans; ANALYZE runs. On writes, wrap it: BEGIN; EXPLAIN ANALYZE UPDATE ...; ROLLBACK; so you get real timings and keep your data."
+        }
+      ],
+      "resources": [
+        {
+          "label": "PostgreSQL: Using EXPLAIN",
+          "url": "https://www.postgresql.org/docs/current/using-explain.html"
+        },
+        {
+          "label": "PostgreSQL: Partial Indexes",
+          "url": "https://www.postgresql.org/docs/current/indexes-partial.html"
+        },
+        {
+          "label": "PostgreSQL: Index-Only Scans and Covering Indexes",
+          "url": "https://www.postgresql.org/docs/current/indexes-index-only-scans.html"
+        },
+        {
+          "label": "roadmap.sh: PostgreSQL DBA",
+          "url": "https://roadmap.sh/postgresql-dba"
+        }
+      ]
+    },
+    "m4-5": {
+      "content": "## The problem\n\nA customer emails on a Tuesday. She pasted an issue link into the wrong Slack channel, someone from a different company clicked it, and it opened. Full issue: title, description, comments, the roadmap it belonged to. Her competitor's employee read her Q3 plan.\n\nThe code that caused it looks completely reasonable:\n\n```ts\n// GET /issues/:id\nconst issue = await getIssueById(req.params.id);\nif (!issue) return res.status(404).json({ error: \"Not found\" });\nreturn res.json(issue);\n```\n\nThe user was authenticated. The token was valid. Nothing threw. The endpoint answered exactly the question it was asked, which was \"give me this issue,\" and nobody ever asked \"is this person allowed to see *this* issue.\"\n\nThat is the bug that ends companies, and it's a bug of omission. There is no line to point at in a code review. You have to notice the line that isn't there.\n\n## The idea\n\nThree questions get collapsed into one word, \"auth,\" and separating them is most of the work.\n\n**Authentication** is *who are you*. A valid signed token. Answered once, in middleware, at the edge.\n\n**Authorization** is *may you perform this verb*. Can a viewer delete an issue? This depends on the actor's role, not on which row they picked.\n\n**Tenancy isolation** is *may you touch this row at all*. Does this issue belong to an organization you're a member of? This depends on the row, and it is the one people forget.\n\nThink of an office building. The badge reader at the entrance is authentication. Your badge level opening the server room is authorization. And your company renting only the fourth floor is tenancy. Fail the third and a perfectly valid badge, at a perfectly appropriate level, opens someone else's office.\n\nRoles get simpler when you stop enumerating combinations and give them numbers.\n\n```\nowner        50   billing, delete the org, manage admins\nadmin        40   manage members, all projects\nproject_lead 30   manage assigned projects, delete issues\nmember       20   create and edit issues, comment\nviewer       10   read only\n```\n\n\"At least member level\" becomes `userLevel >= 20`. Adding a role between two existing ones is a new number, not an audit of every conditional in your codebase.\n\n## In practice\n\nMembership is a table, and it is the only source of truth about who belongs to what.\n\n```sql\nCREATE TABLE org_members (\n  org_id     uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,\n  user_id    uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,\n  role       text NOT NULL CHECK (role IN ('owner','admin','project_lead','member','viewer')),\n  created_at timestamptz NOT NULL DEFAULT now(),\n  PRIMARY KEY (org_id, user_id)\n);\n\nCREATE INDEX org_members_user_idx ON org_members (user_id);\n```\n\nThen write the check exactly once, as a factory: a function that takes configuration and returns a middleware.\n\n```ts\nconst ROLE_LEVELS = {\n  owner: 50, admin: 40, project_lead: 30, member: 20, viewer: 10,\n} as const;\n\nexport function requireRole(minimumRole: keyof typeof ROLE_LEVELS) {\n  return async (req: Request, res: Response, next: NextFunction) => {\n    const orgId = req.params.orgId;\n    if (!orgId) return res.status(400).json({ error: \"org_id is required\" });\n\n    const membership = await findMembership(orgId, req.user.id);\n    if (!membership) return res.status(403).json({ error: \"Not a member of this organization\" });\n\n    if (ROLE_LEVELS[membership.role] < ROLE_LEVELS[minimumRole]) {\n      return res.status(403).json({ error: `Requires ${minimumRole}` });\n    }\n\n    req.orgId = orgId;\n    req.orgRole = membership.role;\n    next();\n  };\n}\n```\n\nThe outer function runs once at startup and captures the minimum role. The inner one runs per request. That's the whole trick, and it's the same shape as a React hook factory or a Redux middleware.\n\nNow the routes declare their own requirements, and no handler contains an authorization `if`:\n\n```ts\nrouter.get   (\"/orgs/:orgId/projects/:pid/issues\", requireRole(\"viewer\"),       listIssues);\nrouter.post  (\"/orgs/:orgId/projects/:pid/issues\", requireRole(\"member\"),       createIssue);\nrouter.delete(\"/orgs/:orgId/issues/:id\",           requireRole(\"project_lead\"), deleteIssue);\n```\n\nRead that block top to bottom and you can audit the permissions of an entire resource in five seconds. Compare it to the same policy expressed as copy-pasted checks inside twelve handlers, where the bug is always in the one that got pasted before the policy changed.\n\n**Then do it again in the database.** The middleware is the front door. RLS is the load-bearing wall, and it holds when someone comes in through a window: a background job, a psql session, a new endpoint written on a Friday by someone who didn't know the convention.\n\nA single-owner policy compares one column. An org-scoped policy joins through membership.\n\n```sql\nALTER TABLE issues ENABLE ROW LEVEL SECURITY;\n\nCREATE POLICY issues_select_org_member ON issues FOR SELECT\n  USING (\n    project_id IN (\n      SELECT p.id\n        FROM projects p\n        JOIN org_members om ON om.org_id = p.org_id\n       WHERE om.user_id = auth.uid()\n    )\n  );\n```\n\nNow re-read the leaking endpoint from the top of this module. With that policy in place, `getIssueById()` for another org's issue returns zero rows, and your existing `if (!issue) return 404` handles it correctly by accident. The row didn't exist, as far as this user is concerned. That is what defense in depth actually buys: the missing check stops being a breach and becomes a 404.\n\nTwo things to notice about that policy. It has no `org_id` parameter, because it never trusts a value the caller supplied. And it's `FOR SELECT` only, which means with RLS enabled and no other policy, `UPDATE` and `DELETE` on this table are denied for everyone. RLS denies by default once enabled. The dangerous state is not \"a missing policy,\" it's **a table where you never enabled RLS at all.**\n\n## In your world\n\n`project-tracker-api` is this module end to end. `src/middleware/rbac.ts` has the factory, the migration has the `check_org_role()` function and the membership-joining policies, and `src/routes/issues.ts` shows the declarations. Read the middleware for one detail worth arguing about: it reads `orgId` from the route param, the query string, *or* the body. The body is attacker-controlled data. It happens to be safe here, because the code then verifies membership in that org rather than trusting the value. Make sure you can explain why that distinction is the thing keeping it safe, because the same pattern without the membership lookup is a vulnerability.\n\nYour work backend is multi-tenant in a different shape: many users rather than many orgs, with the same structural answer. Access flows through a request-scoped database handle that carries the caller's identity, so RLS applies to every query a route makes. There is also a privileged handle that bypasses RLS, reserved for background jobs that legitimately act on all users' data. The reason that distinction is guarded so carefully is exactly this module: using the privileged handle in a request path turns a tenancy check you thought you had into one you don't.\n\n## Watch out\n\n- Roles baked into a JWT go stale. Demote someone from admin and their existing token still claims admin until it expires. Either look up the role per request, or keep tokens short and accept the window deliberately.\n- `403` versus `404` leaks information, because \"Forbidden\" confirms the resource exists. For cross-tenant access `404` is the more honest answer, and RLS gives you it for free.\n- Middleware protects routes and nothing else: job handlers, admin scripts, database consoles, and any connection using a service key never run it. The service-role key also bypasses RLS, and table owners bypass their own policies unless you `FORCE ROW LEVEL SECURITY`, so test policies as a real authenticated user.\n- Every join in an RLS policy runs on every query against that table. Index `org_members(user_id)` and `projects(org_id)` or your security model becomes your performance problem.",
+      "tasks": [
+        "Create two orgs with two different owner accounts, each with a project and a few issues, plus two real tokens. This is the fixture every task below depends on, so build it once and keep it.",
+        "Implement requireRole as a middleware factory with numeric role levels, then mount it on every org-scoped route and delete every authorization check from the handlers.",
+        "For each route in project-tracker-api, write the minimum role in a table and justify it in one clause. Argue with yourself about issue deletion: project_lead or admin?",
+        "Write the org-scoped RLS SELECT policy for issues that joins through projects to org_members, and verify with both tokens that each user sees only their own org's issues.",
+        "Prove defense in depth: comment out requireRole on GET /issues/:id, then try to read another org's issue with a valid token and confirm RLS turns the hole into a 404.",
+        "Run the pg_class / pg_policy audit query and confirm every table holding user data has RLS enabled and at least one policy. Save the query somewhere you will actually re-run it.",
+        "Demote a user from admin to viewer while they hold a valid token, then call an admin route with that token and decide whether your system checks the role per request or trusts the claim."
+      ],
+      "quiz": [
+        {
+          "q": "What is the difference between authorization and tenancy isolation?",
+          "options": [
+            "They are two names for the same check",
+            "Authorization asks whether you may perform this verb; tenancy isolation asks whether this specific row belongs to an organization you are a member of",
+            "Authorization happens in the database and tenancy in middleware",
+            "Tenancy isolation only matters for admin users"
+          ],
+          "answer": 1,
+          "explain": "Role checks are about the verb and ignore which row you picked. Tenancy is about the row. A valid token at an appropriate role level opening another org's data is a tenancy failure with authorization working perfectly, which is exactly how cross-tenant leaks ship."
+        },
+        {
+          "q": "Why is requireRole('admin') written as a function that returns a middleware function?",
+          "options": [
+            "To make it asynchronous",
+            "So the configuration is captured once at mount time while the check itself runs per request, letting each route declare its own minimum role",
+            "Because Express requires all middleware to be factories",
+            "To give each route its own database connection"
+          ],
+          "answer": 1,
+          "explain": "The outer call captures the minimum role at startup; the returned function runs per request. That is what lets the route table itself express the whole permission policy, auditable in one screen, instead of the same check being pasted into twelve handlers."
+        },
+        {
+          "q": "What makes an org-scoped RLS policy different from a single-owner policy?",
+          "options": [
+            "It runs faster because it uses an index",
+            "It compares a column to auth.uid() twice instead of once",
+            "It joins to the membership table to derive which orgs the caller belongs to, rather than comparing one owner column, and never trusts an org id supplied by the caller",
+            "It must be written as a SECURITY DEFINER function"
+          ],
+          "answer": 2,
+          "explain": "Single-owner is `auth.uid() = user_id`. Multi-tenant is a subquery through org_members, so membership is derived server-side. The policy takes no parameters, which is precisely why a caller cannot influence it by editing a request body."
+        },
+        {
+          "q": "You enable RLS on a table and write only a FOR SELECT policy. What happens to UPDATE?",
+          "options": [
+            "Updates are allowed, since only SELECT is restricted",
+            "Updates are denied for everyone, because RLS denies by default once enabled and no policy permits them",
+            "Updates fall back to the SELECT policy",
+            "Postgres raises an error at migration time"
+          ],
+          "answer": 1,
+          "explain": "RLS is deny-by-default. A missing policy is restrictive, not permissive. The genuinely dangerous state is a table where nobody ever ran ALTER TABLE ... ENABLE ROW LEVEL SECURITY, because then no policy applies at all."
+        },
+        {
+          "q": "Your middleware checks membership on every org route. Why is that still not sufficient?",
+          "options": [
+            "Middleware can be bypassed by sending a different HTTP method",
+            "Middleware only protects HTTP routes; job handlers, admin scripts, psql sessions, and any connection using a privileged key never run it",
+            "Express evaluates middleware after the route handler",
+            "Middleware cannot read route parameters reliably"
+          ],
+          "answer": 1,
+          "explain": "Every future entry point is outside your middleware. RLS sits at the data layer, so it applies to whatever reaches the database with a user identity. That is the whole argument for enforcing the same rule twice."
+        }
+      ],
+      "resources": [
+        {
+          "label": "PostgreSQL: Row Security Policies",
+          "url": "https://www.postgresql.org/docs/current/ddl-rowsecurity.html"
+        },
+        {
+          "label": "Supabase: Row Level Security",
+          "url": "https://supabase.com/docs/guides/database/postgres/row-level-security"
+        },
+        {
+          "label": "OWASP API Security Project",
+          "url": "https://owasp.org/www-project-api-security/"
+        }
+      ],
+      "trap": {
+        "title": "The table you forgot",
+        "content": "Set up two tenants properly. Org A with you as `owner`, Org B with a second test user as `owner`. A project in each, a few issues in each, and at least two comments on one of Org B's issues. Two real Supabase user tokens, one per user.\n\nNow write the org-scoped RLS policies for `organizations`, `org_members`, `projects`, and `issues`. Do it carefully, with the membership join. Then deliberately skip `comments`. Enable RLS on it, add no policy at all, and move on as if you'd finished.\n\nVerify the part you did well. As user A, using their token so `auth.uid()` is A:\n\n```sql\nSELECT id, key, title FROM issues WHERE project_id = 'ORG_B_PROJECT_ID';\n```\n\nZero rows. The policy works and it feels finished. This is the exact moment the bug ships in real life: your check passed, so you stopped checking.\n\nNow come at the same data from the side. Take an issue id from Org B, which any user can obtain from a pasted link, and go through the endpoint that lists comments:\n\n```bash\ncurl -H \"Authorization: Bearer USER_A_TOKEN\" \\\n  http://localhost:3004/issues/ORG_B_ISSUE_ID/comments\n```\n\nTwo things can happen here, and both are worth living through.\n\nIf comments has RLS enabled with no policy, you get zero rows, and the deny-by-default behaviour saved you. Note that carefully: you were protected by an accident of configuration, not by anything you designed.\n\nNow do the version that actually bites. Run `ALTER TABLE comments DISABLE ROW LEVEL SECURITY;`, which is the true state of every table where someone forgot the line entirely, and hit that endpoint again. Org B's comments come back through your API, to a user with no membership anywhere near them, with a 200 status code and no error in any log.\n\nSit with the numbers before you fix it. Your app has eleven tables. Ten have correct policies. That is a 91% score, and it is a total failure, because an attacker needs one table and gets to pick which. Security posture is the minimum across your tables, never the average.\n\nThen fix it three ways and keep all three:\n\n1. Add the membership-joining policy to `comments`, going through `issues` to `projects` to `org_members`.\n2. Add the authorization check the endpoint should have had: verify org membership for the issue before reading its comments, so the middleware layer stops it too.\n3. Write the query that answers \"which tables have RLS disabled or zero policies,\" and run it as the last step of every migration you ever write:\n\n```sql\nSELECT c.relname, c.relrowsecurity, count(p.polname) AS policies\n  FROM pg_class c\n  LEFT JOIN pg_policy p ON p.polrelid = c.oid\n WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r'\n GROUP BY c.relname, c.relrowsecurity\n ORDER BY c.relrowsecurity, policies;\n```\n\nThe third one is the deliverable. Fixing this instance of the bug is worth an afternoon. Owning a query that finds the next instance before a customer does is worth the rest of your career."
+      }
+    },
+    "m4-6": {
+      "content": "## The problem\n\nYou have spent years on the receiving end of this, so let's use your own scar tissue.\n\nYou built a screen against an endpoint returning a user object with `avatar`. Sometimes `avatar` is `null`. Sometimes the key isn't there at all. Your optional chaining handles one of those and your type says the other is impossible, so the crash only happens for users who never uploaded a photo *and* signed up before March.\n\nErrors are worse. One endpoint returns `{ \"error\": \"Invalid token\" }`. Another returns `{ \"message\": \"invalid_token\" }`. A third returns HTML from the reverse proxy. Your error handling is a chain of `??` because there is no shape to parse, only shapes to guess at.\n\nThen the backend team shipped v2. On a Tuesday. Your app is in App Store review, and the build currently on phones talks to v1, which now returns 404. You cannot hotfix that, because a hotfix takes two days to reach users and some of them will never update.\n\nNow you're on the other side of that wall, and the thing to internalize is that a mobile client is not a browser. You cannot deploy a fix to it. Every response shape you ship is permanent for as long as some phone is still running the build that expects it.\n\n## The idea\n\nAn API is a published contract with an install base you do not control.\n\nThe closest analogy from your world is a native module's public interface. Once other teams import it, you can add methods forever, but renaming one breaks builds you have never seen. Every API decision is that decision, with a longer tail and worse observability.\n\nWhich produces one governing rule: **prefer additive change to versioning.** Versioning is the expensive escape hatch for when additive change genuinely cannot express what you need. Most breaking changes are not necessity, they're impatience about a name.\n\n## In practice\n\n**Resource naming.** Plural nouns, no verbs, no deep nesting. The URL identifies a thing; the method says what you're doing to it.\n\n```\nGET    /listings                       list\nPOST   /listings                       create\nGET    /listings/:id                   read one\nPATCH  /listings/:id                   partial update\nDELETE /listings/:id                   remove\nGET    /listings/:id/offers            the offers on this listing\n```\n\nNest one level to express ownership, then stop. `/orgs/:orgId/projects/:pid/issues/:id/comments/:cid` is a URL nobody can construct without reading source. Once a resource has a globally unique id, address it directly as `/comments/:cid`. Nesting scopes collections; direct paths address single items.\n\nVerbs in URLs are a smell with one honest exception: genuine state transitions that aren't a resource update. `POST /orders/:id/refunds` (a refund is a thing) beats `POST /orders/:id/refund` (an action), and both beat pretending a refund is a `PATCH` of a status field.\n\n**Status codes, chosen rather than defaulted.**\n\n| Code | Use it when |\n|---|---|\n| 200 | Success with a body |\n| 201 | Created. Include a `Location` header pointing at the new resource. |\n| 202 | Accepted, work happens later. The response body should carry a way to check on it. |\n| 204 | Success, no body. Deletes. |\n| 400 | Malformed request, unparseable |\n| 401 | No valid credentials. The client should re-authenticate. |\n| 403 | Valid credentials, not allowed. Re-authenticating won't help. |\n| 404 | Not found, or not yours to know about |\n| 409 | Conflict with current state. Listing already sold, duplicate slug. |\n| 422 | Well-formed and semantically invalid. Validation failures. |\n| 429 | Rate limited. Always include `Retry-After`. |\n\nThe 401/403 distinction matters because your client branches on it: 401 means clear the token and show login, 403 means show a message. Conflate them and the app logs users out for touching an admin button.\n\n**One error envelope. Everywhere. Including the 500s.**\n\n```json\n{\n  \"error\": {\n    \"code\": \"listing_unavailable\",\n    \"message\": \"This listing has already been sold.\",\n    \"details\": [{ \"field\": \"listing_id\", \"issue\": \"not_active\" }],\n    \"requestId\": \"01HQ8Z3K9M\"\n  }\n}\n```\n\n`code` is a stable machine string the client switches on. `message` is human text that may be reworded any time, so clients must never match on it. `details` carries per-field validation output. `requestId` is what a user reads to you over the phone so you can find their exact request, and it belongs on every response, not just failures.\n\nNever return a 200 with an error inside it. Your `fetch` wrapper checks `res.ok` and you know it does.\n\n**Pagination.** Cursor, not offset. You already know why: with offset, new rows shift the window and infinite scroll shows duplicates. Keep the envelope identical on every list endpoint:\n\n```json\n{\n  \"data\": [ { \"id\": \"...\" } ],\n  \"pagination\": { \"nextCursor\": \"eyJpZCI6...\", \"hasMore\": true }\n}\n```\n\nCap `limit` server-side. An endpoint that honours `?limit=100000` is a denial-of-service tool you shipped on purpose.\n\n**Sparse fieldsets** let a slow screen ask for less without you building a second endpoint: `GET /listings?fields=id,title,price`. Validate the field list against an allowlist, because passing user strings into a `SELECT` is exactly the injection this module's sequel is about.\n\n**Versioning, and when not to.** URL versioning (`/v1/listings`) is visible, cacheable, and greppable in logs. Header versioning (`Accept: application/vnd.api.v2+json`) keeps URLs canonical but is invisible in a browser and in most people's debugging. Pick URL versioning unless you have a strong reason, mostly because you can see it.\n\nThen avoid using it. These changes are additive and safe:\n\n- Adding a new field to a response\n- Adding a new optional request field\n- Adding a new endpoint\n- Making a previously-required request field optional\n- Loosening a validation rule\n\nThese are breaking, whatever you call them:\n\n- Renaming or removing a response field\n- Changing a field's type, including `\"42\"` to `42`\n- Making an optional request field required\n- Tightening validation\n- Changing a status code for an existing outcome\n- Adding a value to an enum the client switches on exhaustively\n\nThat last one surprises people. Adding `disputed` to your order status enum is additive on the wire and breaking in a client whose switch has no default branch. Ship enum extensions like breaking changes, because you are the client and you know your switch statements.\n\nWhen you must break: run both versions concurrently, instrument which version each request uses, and retire the old one only when its traffic is genuinely zero. For a mobile client that means months, not weeks.\n\n**Idempotency keys** belong in your contract, not just your payment code. `POST` is not idempotent by nature, so let the client make it so: accept an `Idempotency-Key` header on every endpoint that creates something, store it, and return the original response on a replay. That's the difference between a flaky network causing a retry and causing a duplicate.\n\n**Webhooks** are you becoming someone else's unreliable client, so give them what you wish you had:\n\n- **At-least-once delivery.** You will send duplicates. Say so in your docs, and give consumers a stable `event.id` to deduplicate on.\n- **Signatures.** Sign the raw body with a shared secret and a timestamp. Without this, your webhook endpoint is an unauthenticated write endpoint on the public internet.\n- **Retries with exponential backoff**, a cap, and a dead-letter view consumers can inspect. Retrying forever against a permanently-broken consumer is a self-inflicted outage.\n- **No ordering guarantee.** `order.shipped` can arrive before `order.paid`, so include a timestamp and design consumers to tolerate it.\n\n## In your world\n\nYou are simultaneously the author and the victim here, which is unusual and useful. Your work backend declares routes with zod-openapi schemas, so request and response shapes are declared objects rather than whatever the handler happens to return. That's the mechanism; the discipline is yours. Rename a response field and next week's app build is fine while last month's starts rendering blanks. Nothing fails loudly: no error, just an undefined that renders as empty space.\n\nDo it concretely. Pick one endpoint your app consumes, open its route schema, and write down what would break in the app for each of: adding a field, renaming a field, changing a number to a string, adding an enum value. Then go make `marketplace-api` and `project-tracker-api` consistent, since they currently return `{ error: \"...\" }` from some paths and raw thrown messages from others. One envelope in the error handler, plus a request id, and see how much simpler a client against them becomes.\n\n## Watch out\n\n- `200 { \"error\": ... }` defeats every HTTP-aware client, cache, and dashboard in the chain. Use the status line.\n- `null` and absent are different values to a client. Pick one convention for \"no value\" and hold it across every endpoint, forever.\n- Don't leak internal ids, table names, or stack traces in error responses. `details` is for the user's mistakes, not your schema.\n- Don't version the whole API for one endpoint's change: `/v2/listings` alongside `/v1/listings` beats a global cutover. And an endpoint whose contract lives only in the handler will be described to your mobile team from memory, incorrectly.",
+      "tasks": [
+        "Write your error envelope as a zod schema, wire it into the error handler of both marketplace-api and project-tracker-api, and confirm every failure path — including an unhandled throw — returns that exact shape with a request id.",
+        "Audit every endpoint in one project against the status code table. List each response you would change and why, paying attention to anywhere you used 400 for a validation failure or 403 where 404 leaks less.",
+        "Take one endpoint your mobile app consumes and write down, for each of these changes, exactly what the currently-shipped app build would do: add a field, rename a field, change a number to a string, add an enum value.",
+        "Standardize both projects' list endpoints on one pagination envelope with nextCursor and hasMore, and add a server-side maximum limit.",
+        "Implement ?fields= sparse fieldsets on one list endpoint with an allowlist, then try to pass a column name that is not on the list and confirm it is rejected rather than interpolated.",
+        "Design a webhook you would emit for order status changes: event id, event type, payload, signature header, retry schedule. Then write the paragraph you would put in the docs telling consumers to deduplicate on event id.",
+        "Add an Idempotency-Key header to every POST that creates something in one project, and document which endpoints honour it."
+      ],
+      "quiz": [
+        {
+          "q": "Which of these is a breaking change for a mobile client already in the wild?",
+          "options": [
+            "Adding a new optional field to a response",
+            "Renaming a response field from avatar to avatarUrl",
+            "Adding a brand new endpoint",
+            "Making a previously required request field optional"
+          ],
+          "answer": 1,
+          "explain": "A rename removes the old key. The shipped app reads undefined and renders blank with no error, so it fails silently and you cannot deploy a fix to phones. Additive changes are safe; removals and renames are not, however small they look."
+        },
+        {
+          "q": "When should an API return 401 rather than 403?",
+          "options": [
+            "401 for missing permissions, 403 for an expired token",
+            "401 when there are no valid credentials, so the client should re-authenticate; 403 when credentials are valid but the action is not allowed",
+            "They are interchangeable as long as you are consistent",
+            "401 for authenticated users, 403 for anonymous ones"
+          ],
+          "answer": 1,
+          "explain": "Clients branch on this. 401 means clear the token and show login; 403 means show a message. Conflate them and your app logs users out whenever they tap something their role does not permit."
+        },
+        {
+          "q": "Why is cursor pagination the right default for a feed the mobile app scrolls?",
+          "options": [
+            "It returns fewer bytes per page",
+            "It allows sorting by any column",
+            "Offset pagination shifts the window when rows are inserted, so infinite scroll shows duplicates or skips items",
+            "Cursors can be cached and offsets cannot"
+          ],
+          "answer": 2,
+          "explain": "OFFSET 20 means 'skip the first 20 rows right now'. Insert three rows while the user scrolls and page two overlaps page one. A cursor anchors to a row's position in the sort order, so the window stays stable."
+        },
+        {
+          "q": "What delivery guarantee should you document for the webhooks you emit?",
+          "options": [
+            "Exactly once, in order",
+            "At most once, so consumers never see duplicates",
+            "At least once and unordered, so consumers must deduplicate on a stable event id and tolerate out-of-order arrival",
+            "Best effort, with no retries"
+          ],
+          "answer": 2,
+          "explain": "Retries plus network reality make duplicates inevitable, and parallel delivery makes ordering unreliable. Exactly-once is not something an HTTP callback can promise. Give consumers an event id and a timestamp and say so plainly in the docs."
+        },
+        {
+          "q": "Why is returning HTTP 200 with an error object in the body a problem?",
+          "options": [
+            "It uses more bandwidth than a 4xx response",
+            "Every HTTP-aware layer — the client's res.ok check, caches, proxies, monitoring — reads the status line and concludes the request succeeded",
+            "JSON error objects cannot include a status code",
+            "Some HTTP clients cannot parse a body on a 200 response"
+          ],
+          "answer": 1,
+          "explain": "The status line is the machine-readable outcome, and everything in the chain trusts it. A 200 with an error inside forces every client to inspect bodies to find failures, and your error rate dashboards read zero while users are broken."
+        }
+      ],
+      "resources": [
+        {
+          "label": "roadmap.sh: API Design",
+          "url": "https://roadmap.sh/api-design"
+        },
+        {
+          "label": "MDN: HTTP response status codes",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Status"
+        },
+        {
+          "label": "Stripe: Idempotent requests",
+          "url": "https://docs.stripe.com/api/idempotent_requests"
+        },
+        {
+          "label": "Stripe: Webhooks",
+          "url": "https://docs.stripe.com/webhooks"
+        }
+      ]
+    },
+    "m4-7": {
+      "content": "## The problem\n\nMost breach write-ups are disappointingly boring. Nobody wrote a buffer overflow. Somebody changed a number in a URL.\n\nThe shape recurs every year: an app's API lets you fetch another user's full profile by incrementing the id in `/api/users/:id`. The token was yours. The endpoint was authenticated. It simply never asked whether the id you passed belonged to you. A curious user finds it in an afternoon with the dev tools they already had open.\n\nYou wrote this endpoint yesterday:\n\n```ts\nrouter.get(\"/orders/:id\", requireAuth, async (req, res) => {\n  const order = await getOrderById(req.params.id);\n  if (!order) return res.status(404).json({ error: \"Not found\" });\n  res.json(order);\n});\n```\n\n`requireAuth` proved the caller is *a* user. Nothing here proves they are *this order's* user. And because order ids are UUIDs, you'll tell yourself they're unguessable, which holds right up until one leaks in a support screenshot, a shared link, a referrer header, or a client-side log.\n\n## The idea\n\nEvery authenticated request carries two questions, and codebases answer the first beautifully while forgetting the second.\n\n1. Who are you? Solved once, in middleware, with a token signature.\n2. Are you allowed to touch **this specific row**? Not solved anywhere, unless someone wrote it.\n\nHotel key cards. The lock checks that your card is valid and issued by this hotel. If that's *all* it checks, your card opens every door in the building. Valid credential, wrong room. That's broken object-level authorization, and it tops the OWASP API Top 10 because it's the easiest thing in the world to leave out.\n\n## In practice\n\nWalk the list, weighted by where damage actually happens.\n\n**1. Broken object-level authorization (BOLA).** Make the ownership condition part of the query, so no code path can fetch a row you aren't entitled to.\n\n```ts\n// Vulnerable: fetch, then hope\nconst order = await db.select().from(orders).where(eq(orders.id, id));\n\n// Scoped: the identity is in the WHERE clause\nconst [order] = await db\n  .select()\n  .from(orders)\n  .where(and(eq(orders.id, id), or(eq(orders.buyerId, userId), eq(orders.sellerId, userId))));\n```\n\nThen put RLS underneath, because a scoped query is a convention and conventions get skipped. This is the entire reason RLS exists: it moves the ownership condition from something every developer must remember into something the database applies whether they remembered or not. A forgotten check becomes an empty result instead of a breach.\n\n**2. Broken authentication.** Verify the token's signature with the issuer's key and check `exp`, `iss`, and `aud`. Decoding a JWT is not verifying it: `jwt.decode()` will happily hand you claims from a token an attacker wrote in a text editor. Keep expiry short, and never let the token choose its own algorithm.\n\n**3. Excessive data exposure.** `SELECT *` plus `res.json(row)` publishes your schema.\n\n```ts\n// This ships password_hash, internal_notes, stripe_customer_id, and every column you add later\nres.json(user);\n\n// A response DTO is an allowlist. New columns are private until you decide otherwise.\nres.json({\n  id: user.id,\n  displayName: user.displayName,\n  avatarUrl: user.avatarUrl,\n  createdAt: user.createdAt,\n});\n```\n\nThe direction of the default is the whole point. Returning the row makes every future migration a potential disclosure decided by whoever writes it. A DTO means adding a column changes nothing until someone deliberately exposes it. And \"the app doesn't display that field\" is not protection: the field is in the body either way, visible to anyone with a proxy.\n\n**4. Mass assignment.** The mirror image, on the way in.\n\n```ts\n// The client controls this object. All of it.\nawait db.update(users).set({ ...req.body }).where(eq(users.id, userId));\n```\n\nSend `{\"role\":\"admin\",\"emailVerified\":true}` and you have promoted yourself. Validate into an explicit shape and use only the validated output:\n\n```ts\nconst updateProfileSchema = z.object({\n  displayName: z.string().min(1).max(80),\n  bio: z.string().max(500).optional(),\n}).strict();   // unknown keys are an error, not a silent pass-through\n\nconst input = updateProfileSchema.parse(req.body);\nawait db.update(users).set(input).where(eq(users.id, userId));\n```\n\n`.strict()` matters: without it extra keys are stripped silently, which is safe but tells you nothing when a client sends something you didn't expect.\n\n**5. Missing rate limits.** An unlimited login endpoint is a credential-stuffing service you host for free. Rate-limit auth endpoints hardest, keyed on the account identifier as well as the IP, because one attacker holds thousands of IPs and one victim has one email address. Rate limit expensive reads too: search, export, anything aggregating.\n\n**6. Injection.** String-built SQL ends here.\n\n```ts\n// Vulnerable. `sort` is user input.\nawait db.execute(`SELECT * FROM listings ORDER BY ${sort}`);\n\n// Parameterized: the value can never become syntax.\nawait db.execute(sql`SELECT * FROM listings WHERE seller_id = ${sellerId}`);\n```\n\nParameterized queries work because the value travels separately from the statement. The database parses the SQL first, then binds values into slots, so `'; DROP TABLE listings; --` arrives as a string matching no seller rather than as a second statement. Note the one case parameters *cannot* help: identifiers. Column and table names can't be bound, so a sortable-column feature needs an allowlist, never interpolation.\n\n**7. Secrets.** Validate every one at startup so a missing variable crashes on boot rather than 500ing at 2am. Never commit them: a secret that has touched git history is burned, and rotation is the only fix, because rewriting history doesn't reach forks and clones. Don't log them either. Scrub `authorization` headers and auth-route bodies before they reach your logger or error tracker, since a Sentry event holding a token is a secret in a third-party system.\n\n**8. Security headers and CORS.** `helmet()` sets sensible defaults in one line, so there's no excuse. CORS wants an explicit allowlist:\n\n```ts\napp.use(cors({\n  origin: [\"https://app.example.com\", \"https://admin.example.com\"],\n  credentials: true,\n}));\n```\n\n`origin: \"*\"` with `credentials: true` is a combination browsers refuse, and the fact that people try it reveals the misunderstanding: CORS does not protect your server, it instructs browsers about who may read your responses. A native mobile client ignores it entirely, so CORS is never your authorization layer.\n\n## In your world\n\nAudit your own five projects, because the findings will be real. Grep for `select('*')` next to `res.json(`, and list every field currently going over the wire including the ones you forgot are columns. Grep for `...req.body`. Then take the ten most sensitive endpoints across the projects and, for each, write the sentence that proves object-level authorization: *\"this cannot return another user's row because ______.\"* If the blank reads \"the id is a UUID,\" you have found a finding.\n\nThe work backend answers this structurally, which is why its conventions look strict for its size. Request handlers use a request-scoped database handle carrying the caller's identity, so RLS applies to every query a route makes. A separate privileged handle exists for jobs that must act across all users, and using it in a request path silently removes the tenancy check from every query underneath. Response shapes are declared schemas rather than whatever the handler returns, which is DTO discipline enforced by the framework. When your mentor hands you a security-hardening PR later in this path, it will be one of these categories, and you should be able to name which before you read the diff.\n\n## Watch out\n\n- A 403 confirms the resource exists, so for cross-tenant access 404 leaks less, and RLS produces it naturally.\n- Authorization implemented in the client is decoration. Hiding a button hides nothing: the endpoint is still there and `curl` still works. Rate limits keyed only on IP are similarly ornamental, since they are trivially bypassed and punish shared networks.\n- Error responses are a disclosure channel. Stack traces, driver messages, and constraint names describe your schema to a stranger.\n- The riskiest endpoint is the newest one. Every convention here is invisible to whoever joins next month, so it has to live in code review and CI rather than in your head, alongside `bun audit` and a plan for when it fails.\n\n## Checkpoint\n\nAnswer these out loud, cold, with the editor closed. If an answer takes more than a minute, that's the topic to revisit.\n\n1. Walk me through how you'd verify a specific endpoint doesn't leak another user's data. What do you actually run, in what order, and what result convinces you?\n2. Why is broken object-level authorization more common in real breaches than injection, given that injection is the one everyone learns first?\n3. What's in your response DTO for the user object, and what did you deliberately leave out? Name a field you excluded and say what an attacker could do with it.\n4. Your cache is serving stale data. How do you decide between fixing invalidation and shortening the TTL, and what would make you choose each?\n5. There's a `SELECT ... FOR UPDATE` in your order creation function. What breaks if I delete that line, and how would you prove the breakage rather than assert it?\n6. A teammate adds a new table holding user data and ships the migration. What must be in that migration, and what exactly is exposed if it isn't?",
+      "tasks": [
+        "Pick the ten most sensitive endpoints across your five projects and, for each, write the sentence that proves object-level authorization: 'this cannot return another user's row because ______.' Any blank that reads 'the id is a UUID' is a finding.",
+        "Grep for select('*') and for handlers that pass a database row straight to res.json. Print the full column list of one such table and mark every field you did not intend to publish.",
+        "Replace one of those responses with an explicit DTO, then add a new column to the table and confirm the response shape is unchanged.",
+        "Find every spread of req.body into a database write, replace it with a strict zod schema, then attempt to promote yourself by POSTing {\"role\":\"admin\"} and confirm the request is rejected rather than silently stripped.",
+        "Add rate limiting to your auth endpoints keyed on both IP and the submitted account identifier. Script 50 failed logins for one email from two IPs and confirm both are throttled.",
+        "Write a deliberately vulnerable sort parameter that interpolates into ORDER BY, exploit it from curl, then fix it with an allowlist and explain why parameter binding could not have fixed it.",
+        "Add helmet() and an explicit CORS origin allowlist to both projects, verify env validation crashes the process on a missing secret, and grep your logger and error-tracking calls for anywhere an authorization header or auth-route body could be serialized."
+      ],
+      "quiz": [
+        {
+          "q": "What is the durable fix for broken object-level authorization?",
+          "options": [
+            "Use UUIDs so ids cannot be guessed",
+            "Put the caller's identity into the query's WHERE clause, and back it with an RLS policy so a forgotten check returns no rows instead of someone else's data",
+            "Return 404 instead of 403 for resources the user cannot access",
+            "Require re-authentication on sensitive endpoints"
+          ],
+          "answer": 1,
+          "explain": "Unguessable ids are obfuscation, not authorization, and ids leak through screenshots, links, and logs. Scoping the query is the fix; RLS is what makes it hold when the next developer forgets, which is the entire reason RLS exists."
+        },
+        {
+          "q": "What vulnerability class is `await db.update(users).set({ ...req.body })`?",
+          "options": [
+            "Injection",
+            "Broken object-level authorization",
+            "Mass assignment: the client controls which columns get written, including role and verification flags",
+            "Excessive data exposure"
+          ],
+          "answer": 2,
+          "explain": "The client decides the shape of the update. Sending {\"role\":\"admin\"} promotes the attacker. Parse into an explicit schema with .strict() and write only the validated output, never the raw body."
+        },
+        {
+          "q": "Why do parameterized queries end SQL injection?",
+          "options": [
+            "They escape dangerous characters before building the statement",
+            "The value travels separately from the statement, so the database parses the SQL first and then binds values into slots where they can never become syntax",
+            "They reject any input containing SQL keywords",
+            "They run the query inside a read-only transaction"
+          ],
+          "answer": 1,
+          "explain": "Parsing happens before binding, so a value is only ever a value. Note the limit: identifiers such as column and table names cannot be bound, so a sortable-column feature needs an allowlist rather than interpolation."
+        },
+        {
+          "q": "Why is a response DTO better than filtering fields your app does not display?",
+          "options": [
+            "DTOs serialize faster than raw rows",
+            "It flips the default: new columns stay private until someone deliberately exposes them, and a field the app ignores is still in the response body for anyone with a proxy",
+            "DTOs let you rename fields without breaking clients",
+            "It removes the need for RLS on that table"
+          ],
+          "answer": 1,
+          "explain": "An allowlist means every future migration is safe by default, whereas returning the row means every migration is a potential disclosure decided by whoever writes it. And the client not rendering a field does nothing — the bytes are on the wire."
+        },
+        {
+          "q": "Why is CORS not an authorization mechanism?",
+          "options": [
+            "Because it only applies to POST requests",
+            "Because it instructs browsers about which origins may read your responses; native mobile clients and curl ignore it entirely",
+            "Because helmet() overrides it",
+            "Because it can be disabled by the client with a header"
+          ],
+          "answer": 1,
+          "explain": "CORS is a browser policy, not a server-side gate. Anything that is not a browser simply calls your endpoint. An explicit origin allowlist is still worth setting, but the real access control is tokens, role checks, and RLS."
+        }
+      ],
+      "resources": [
+        {
+          "label": "OWASP API Security Project (API Top 10)",
+          "url": "https://owasp.org/www-project-api-security/"
+        },
+        {
+          "label": "roadmap.sh: API Security Best Practices",
+          "url": "https://roadmap.sh/best-practices/api-security"
+        },
+        {
+          "label": "Zod: schema validation and .strict()",
+          "url": "https://zod.dev"
+        },
+        {
+          "label": "PostgreSQL: Row Security Policies",
+          "url": "https://www.postgresql.org/docs/current/ddl-rowsecurity.html"
+        }
+      ]
+    },
+    "sq-5": {
+      "content": "## The problem\n\nA buyer completes 3D Secure in their bank's popup, then the app backgrounds while iOS decides it needs the memory. Your client-side success callback never fires. The money left their account and your database still says `payment_processing`. Or the inverse: a modified client POSTs `{\"paid\": true}` to your server and gets a free camera.\n\n## The idea\n\nNever let the client tell your server that payment succeeded. The client is a witness, not a source of truth, and it's a witness on a train in a tunnel. Stripe knows the outcome. Stripe tells you directly, over a channel the buyer's device isn't part of. That channel is the webhook, and it's why the flow has three legs instead of one.\n\n## In practice\n\nThe full loop, in order:\n\n1. `POST /orders` creates the order atomically in Postgres, then creates a Stripe PaymentIntent for `order.total` in cents, with `metadata: { order_id }` so the webhook can find its way home. Return `{ order_id, client_secret }`.\n2. The app takes `client_secret` into Stripe's SDK. Card details go from the device straight to Stripe and never touch your server, which is the whole PCI argument.\n3. Stripe calls `POST /webhooks/stripe`. You verify the signature, look up the order by `payment_intent_id`, and move it to `paid`.\n\nSignature verification needs the exact bytes Stripe sent:\n\n```ts\nconst event = stripe.webhooks.constructEvent(req.body, sig, env.STRIPE_WEBHOOK_SECRET);\n```\n\nWhich is why body parsing breaks it. `express.json()` turns the payload into an object, and re-serializing that object produces different bytes: key order, whitespace, unicode escaping. The signature then fails on a payload that was perfectly genuine. Register the raw handler before the JSON parser:\n\n```ts\napp.use(\"/webhooks/stripe\", express.raw({ type: \"application/json\" }));\napp.use(webhooksRouter);\napp.use(express.json());   // everything else\n```\n\nThen make the handler idempotent, because Stripe delivers at least once and retries anything that isn't a fast 2xx. Store `event.id` in a table with a unique constraint and let the insert conflict tell you it's a replay. Acknowledge with 200 immediately and do slow work in a job, or Stripe times out and retries a request you were already handling.\n\n## In your world\n\n`marketplace-api` has all the pieces: `src/config/stripe.ts`, the ordering in `app.ts`, and `src/routes/webhooks.ts`. Two gaps are yours to close. The handler has no event-id table, so a retry double-processes. And it deliberately doesn't `await` the service call, which returns fast but loses the work if the process dies mid-flight, so the honest version enqueues a job. Run it with `stripe listen --forward-to localhost:3003/webhooks/stripe` and trigger a failed card to watch the cancel path.\n\n## Watch out\n\n- A webhook endpoint has no auth middleware, so the signature *is* the authentication. Skipping verification means anyone can mark orders paid.\n- Handle `payment_intent.payment_failed` too. Cancel the order and re-activate the listing, or your inventory silently disappears.\n- Amounts are always the smallest currency unit. Sending `249.00` instead of `24900` charges two rupees and forty-nine paise.",
+      "tasks": [
+        "Get test keys, run `stripe listen --forward-to localhost:3003/webhooks/stripe`, and complete one successful payment end to end from order creation to a 'paid' status written by the webhook.",
+        "Move the webhook route after express.json() in app.ts, watch signature verification fail on a genuine Stripe request, and read the error carefully before putting it back.",
+        "Add a processed_stripe_events table with event.id as the primary key, insert inside the same transaction as the status change, and prove that replaying an event with `stripe events resend` does not double-process it.",
+        "Trigger a declined card and confirm the order is cancelled and the listing returns to 'active'.",
+        "Replace the fire-and-forget service call in the webhook handler with a job enqueue, so the handler returns 200 in milliseconds and the work survives a process restart."
+      ],
+      "quiz": [
+        {
+          "q": "Why must the server never treat a client-side callback as confirmation of payment?",
+          "options": [
+            "Client callbacks are slower than webhooks",
+            "Payments can complete asynchronously and the device can be backgrounded, lose signal, or be modified, so the client is a witness rather than a source of truth",
+            "Stripe's SDK does not expose the payment result to the client",
+            "The client cannot know the final amount charged"
+          ],
+          "answer": 1,
+          "explain": "3D Secure popups, bank transfers, and dropped connections all break the client's view of the outcome, and a modified client can simply lie. The webhook fires regardless of what the device does, which makes it the only reliable signal."
+        },
+        {
+          "q": "Why does the Stripe webhook route need the raw request body?",
+          "options": [
+            "Because Stripe sends form-encoded data rather than JSON",
+            "Because the signature is computed over the exact bytes Stripe sent, and re-serializing a parsed object produces different bytes",
+            "Because express.json() has a size limit that webhooks exceed",
+            "Because the payload is encrypted and must be decrypted before parsing"
+          ],
+          "answer": 1,
+          "explain": "Key order, whitespace, and unicode escaping all change on re-serialization, so the recomputed signature will not match a perfectly genuine payload. Register express.raw() for that path before express.json() runs."
+        },
+        {
+          "q": "Stripe delivers the same event twice. What makes your handler safe?",
+          "options": [
+            "Returning 200 quickly so Stripe stops retrying",
+            "Checking whether the order status is already 'paid' before updating",
+            "Storing event.id with a unique constraint and treating the conflict as a replay",
+            "Verifying the signature on every delivery"
+          ],
+          "answer": 2,
+          "explain": "Signature verification proves authenticity, not uniqueness, and a status check is a race between two concurrent deliveries. A unique constraint on the event id is decided by the database, atomically, which is what idempotent means here."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Stripe: Payment Intents",
+          "url": "https://docs.stripe.com/payments/payment-intents"
+        },
+        {
+          "label": "Stripe: Webhooks",
+          "url": "https://docs.stripe.com/webhooks"
+        },
+        {
+          "label": "Stripe: Idempotent requests",
+          "url": "https://docs.stripe.com/api/idempotent_requests"
+        }
+      ]
+    },
+    "sq-6": {
+      "content": "## The problem\n\n\"Why was this order refunded?\" Nobody knows. The `orders` row says `refunded` and `updated_at` says Tuesday. Who did it, when it was paid, how long the seller sat on it before shipping, whether it bounced through `cancelled` first: all gone, because an `UPDATE` overwrites history by design.\n\nWorse, an intern's script marked twelve shipped orders back to `pending` to \"retry the notification.\" The `CHECK` constraint allowed it, because `pending` is a legal *value*. It was never a legal *transition*.\n\n## The idea\n\nTwo ideas that pair naturally.\n\n**Append-only events**: keep a row per thing that happened, never updated, never deleted. Current status stops being the record and becomes a summary of the record, which you keep on the order for cheap reads while the events remain the truth.\n\n**A state machine**: an explicit map of which status can become which, and who is allowed to make it happen. A `CHECK` constraint validates values in isolation, one row at a time, with no knowledge of what the row used to be. Transition rules need the previous state, so they live in a place that can see both.\n\n## In practice\n\nThe event log is boringly simple, and that's the feature:\n\n```sql\nCREATE TABLE order_events (\n  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),\n  order_id   uuid NOT NULL REFERENCES orders(id) ON DELETE CASCADE,\n  status     text NOT NULL,\n  actor_id   uuid,\n  metadata   jsonb NOT NULL DEFAULT '{}',\n  created_at timestamptz NOT NULL DEFAULT now()\n);\n\nCREATE INDEX order_events_order_idx ON order_events (order_id, created_at);\n```\n\n`metadata` is where the answers live: `{\"payment_intent_id\":\"pi_...\"}` on paid, `{\"tracking\":\"1Z...\"}` on shipped, `{\"reason\":\"payment_failed\"}` on cancelled. Every insert happens in the same transaction as the status change, so they cannot disagree.\n\nThe machine is a lookup table, not a chain of `if` statements:\n\n```ts\nconst TRANSITIONS = {\n  pending:            { next: [\"payment_processing\", \"cancelled\"], by: \"system\" },\n  payment_processing: { next: [\"paid\", \"cancelled\"],               by: \"system\" },\n  paid:               { next: [\"shipped\", \"refunded\"],             by: \"seller\" },\n  shipped:            { next: [\"completed\"],                       by: \"buyer\"  },\n  completed:          { next: [],                                  by: \"none\"   },\n} as const;\n\nconst rule = TRANSITIONS[order.status];\nif (!rule?.next.includes(nextStatus)) {\n  throw new ConflictError(`Cannot go from ${order.status} to ${nextStatus}`);\n}\n```\n\nTwo rules in one structure: which transitions exist, and who may perform them. `shipped -> pending` isn't rejected by a special case, it's rejected because it was never listed. Terminal states have an empty array and need no extra code.\n\n## In your world\n\n`marketplace-api` has both: `order_events` in migration `001`, and `validTransitions` in `order.service.ts`. Extend it. Add `actor_id` so events name a person, then build `GET /orders/:id/events` into a readable timeline, then answer a real analytics question from events alone: median hours from `paid` to `shipped` per seller. That query is the payoff, and it is impossible against a single status column.\n\nThe same shape is everywhere once you see it. `project-tracker-api` computes before-and-after diffs into an activity feed, which is the same append-only log with a richer payload. Your work backend's notification and moderation flows are state machines whether or not anyone drew them.\n\n## Watch out\n\n- Keep the current status denormalized on the order. Replaying events on every read is elegant and slow.\n- Never `UPDATE` an event. A wrong event is corrected by appending a corrective one, which is also the audit trail of the correction.\n- Enforce transitions in one service function that every path calls. A second write path that skips it makes the machine decorative.",
+      "tasks": [
+        "Add actor_id to order_events and populate it on every write, then build GET /orders/:id/events into a readable timeline.",
+        "Move the transition table into one exported function that every status write must call, then grep for any direct status update that bypasses it and route it through.",
+        "Attempt shipped to pending through the API and confirm it fails with a 409 naming both states. Then attempt it in raw SQL and confirm the CHECK constraint happily allows it.",
+        "Write the analytics query that returns median hours from the 'paid' event to the 'shipped' event per seller, using only order_events.",
+        "Add a terminal state with an empty next array and confirm no extra code was needed to make it terminal."
+      ],
+      "quiz": [
+        {
+          "q": "Why can a CHECK constraint not enforce legal status transitions?",
+          "options": [
+            "CHECK constraints cannot reference text columns",
+            "A CHECK evaluates one row's new values in isolation and has no access to the previous state a transition is defined by",
+            "CHECK constraints only run on INSERT, not UPDATE",
+            "Transitions need to be enforced in the client"
+          ],
+          "answer": 1,
+          "explain": "A CHECK validates values: 'pending' is a legal value, so setting a shipped order back to pending passes. Transitions are a relation between old and new state, which needs a trigger or a service function that can see both."
+        },
+        {
+          "q": "An event was written with the wrong metadata. What do you do?",
+          "options": [
+            "UPDATE the event row with the correct value",
+            "DELETE the event and insert a corrected one",
+            "Append a corrective event, so the log records both the mistake and the correction",
+            "Rebuild the log from the current order status"
+          ],
+          "answer": 2,
+          "explain": "An append-only log is only trustworthy if it is genuinely append-only. Editing history destroys the audit trail you built the table for. The correction is itself a fact worth recording, including who made it and when."
+        },
+        {
+          "q": "Why keep a current status column on the order when the events are the source of truth?",
+          "options": [
+            "Because the events table is not indexed",
+            "Because replaying events on every read is correct but slow, so the denormalized status is a cache of the log with a named cost",
+            "Because RLS cannot be applied to an events table",
+            "Because the status column is what the state machine reads to validate transitions, and events cannot be queried"
+          ],
+          "answer": 1,
+          "explain": "This is the denormalization trade again, made deliberately: the log stays authoritative and the column keeps reads cheap. Both are written in one transaction, so they cannot disagree."
+        }
+      ],
+      "resources": [
+        {
+          "label": "PostgreSQL: Transaction Isolation",
+          "url": "https://www.postgresql.org/docs/current/transaction-iso.html"
+        },
+        {
+          "label": "PostgreSQL: Explicit Locking",
+          "url": "https://www.postgresql.org/docs/current/explicit-locking.html"
+        },
+        {
+          "label": "roadmap.sh: Backend",
+          "url": "https://roadmap.sh/backend"
+        }
+      ]
+    },
+    "sq-7": {
+      "content": "## The problem\n\nEighteen months in, `activity_feed` holds 400 million rows. \"This week's activity\" still works, barely. Deleting last year's data locks the table for nine minutes and generates enough write-ahead log to fill the disk. `VACUUM` never finishes. And every deploy drops a handful of requests, because the container gets `SIGTERM` and the process exits mid-request.\n\n## The idea\n\nFive production patterns, each one a small thing that only matters at the moment it matters.\n\n**Partitioning** splits one logical table into physical chunks by a key. Dropping a month becomes `DROP TABLE`, which is instant and takes no locks worth mentioning.\n\n**Atomic counters** give you `PROJ-42` instead of a UUID nobody can say out loud.\n\n**Change diffs** turn \"Alice updated PROJ-42\" into \"Alice moved it to In Progress and assigned Bob.\"\n\n**Two health checks** answer two different questions.\n\n**Graceful shutdown** is the difference between a deploy and a small outage.\n\n## In practice\n\nPartition by month, and note that the partition key must be in every unique constraint, which is why the primary key is a pair:\n\n```sql\nCREATE TABLE activity_feed (\n  id         uuid DEFAULT gen_random_uuid(),\n  org_id     uuid NOT NULL,\n  created_at timestamptz NOT NULL DEFAULT now(),\n  PRIMARY KEY (id, created_at)\n) PARTITION BY RANGE (created_at);\n\nCREATE TABLE activity_feed_2026_08 PARTITION OF activity_feed\n  FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');\n```\n\nPostgres routes inserts by `created_at` and skips irrelevant partitions on reads, which is **partition pruning**. Confirm it in `EXPLAIN ANALYZE`, which lists the partitions scanned. An insert with no matching partition fails outright, so partitions must exist before the data does: create a year ahead in the migration, or schedule a monthly job.\n\nIssue keys need a per-project counter incremented atomically:\n\n```sql\nUPDATE project_issue_counters\n   SET next_number = next_number + 1\n WHERE project_id = NEW.project_id\n RETURNING next_number - 1 INTO v_number;\n```\n\nOne statement, so concurrent inserts can't collide. `SELECT` then `UPDATE` is two statements with a race between them, and you find out when two issues are both `PROJ-42`.\n\nHealth checks separate two questions. `/health/live` returns 200 if the process runs, and a failure means restart me. `/health/ready` checks Postgres and Redis and returns 503 when degraded, meaning stop routing traffic but don't restart, because restarting won't fix Redis.\n\nThen shut down in order: stop accepting connections, close workers so in-flight jobs finish, close Redis and the pool, exit. Wrap it in a timeout so a stuck query can't hang the deploy forever:\n\n```ts\nconst timer = setTimeout(() => process.exit(1), 10_000);\ntimer.unref();   // the timer must not itself keep the process alive\n```\n\n## In your world\n\n`project-tracker-api` has all five. Read `src/server.ts` alongside `src/routes/health.ts`, then prove the behaviour: start the server, fire a slow request, press Ctrl+C, and watch the request complete before the process exits. Remove the handlers and watch it not. Then check whether partitions exist beyond the ones the migration created, because that missing monthly job is a scheduled outage.\n\nThis is also where your work backend's shape stops being arbitrary. It runs multiple processes on a platform that sends `SIGTERM` on every deploy, and job handlers that die mid-work are exactly what graceful shutdown protects.\n\n## Watch out\n\n- Running out of partitions is a hard insert failure, not a slow query. Alert on the newest partition's end date.\n- Queries that omit the partition key scan every partition, so pruning only helps when `created_at` is in the `WHERE`.\n- `SIGKILL` cannot be caught. Your window is whatever the platform allows before it, usually around 30 seconds.",
+      "tasks": [
+        "Create the partitioned activity_feed with monthly partitions, insert rows with created_at across three months, and confirm with EXPLAIN ANALYZE that a query filtered on created_at prunes the other partitions.",
+        "Insert a row dated beyond your last partition, read the error, then write the job or migration that creates partitions ahead of time so it can never happen in production.",
+        "Drop an old partition and time it. Compare against DELETE FROM activity_feed WHERE created_at < ... on the same volume.",
+        "Implement the atomic issue-key counter with UPDATE ... RETURNING, then fire 50 concurrent issue creations and assert 50 distinct keys with no gaps.",
+        "Implement before/after change diffs on issue update and confirm the activity feed reads 'moved to In Progress and assigned Bob' rather than 'updated PROJ-42'.",
+        "Add /health/live and /health/ready, stop Redis, and confirm live returns 200 while ready returns 503 with a per-dependency breakdown.",
+        "Fire a slow request, press Ctrl+C, and watch it complete before the process exits. Then remove the signal handlers and watch it not."
+      ],
+      "quiz": [
+        {
+          "q": "Why must created_at be part of the primary key on a table partitioned by range on created_at?",
+          "options": [
+            "To keep rows sorted within each partition",
+            "Because Postgres requires the partition key in every unique constraint, since it needs it to know which partition to check for uniqueness",
+            "Because uuid alone is not unique enough across partitions",
+            "To let partition pruning work on primary key lookups"
+          ],
+          "answer": 1,
+          "explain": "Uniqueness on a partitioned table is enforced per partition, so Postgres must be able to route a candidate row from the constrained columns alone. PRIMARY KEY (id) by itself is rejected."
+        },
+        {
+          "q": "The readiness probe fails but the liveness probe passes. What should the platform do?",
+          "options": [
+            "Restart the container immediately",
+            "Stop routing traffic to this instance but leave the process running",
+            "Nothing, since liveness is the authoritative check",
+            "Roll back the deployment"
+          ],
+          "answer": 1,
+          "explain": "Liveness answers 'should I restart this?' and readiness answers 'should I send it traffic?'. If Redis is down, the process is fine and restarting fixes nothing, but the instance should be pulled from rotation until its dependencies recover."
+        },
+        {
+          "q": "Why does the shutdown timeout call timer.unref()?",
+          "options": [
+            "To make the timer fire earlier if shutdown finishes first",
+            "Because a pending timer keeps the Node event loop alive, so without unref the 10 second timer would itself delay a clean exit",
+            "To prevent the timer from being garbage collected",
+            "Because unref is required for any timer created during shutdown"
+          ],
+          "answer": 1,
+          "explain": "Timers are handles that hold the event loop open. unref() tells Node this one should not count, so once the real cleanup is done the process exits immediately rather than waiting out its own safety net."
+        }
+      ],
+      "resources": [
+        {
+          "label": "PostgreSQL: Table Partitioning",
+          "url": "https://www.postgresql.org/docs/current/ddl-partitioning.html"
+        },
+        {
+          "label": "PostgreSQL: Partial Indexes",
+          "url": "https://www.postgresql.org/docs/current/indexes-partial.html"
+        },
+        {
+          "label": "Node.js: Process (signal events, exit)",
+          "url": "https://nodejs.org/api/process.html"
+        }
+      ]
+    }
+  }
+}

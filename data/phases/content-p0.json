@@ -1,0 +1,596 @@
+{
+  "phaseId": "p0",
+  "modules": {
+    "m0-1": {
+      "content": "## The problem\n\nSupport forwards you three messages in one morning. A user in Kochi says the feed \"never loads, just spins.\" A user on hotel wifi says login fails instantly with \"Network request failed.\" A third sends a screenshot of your generic error toast with no detail at all. You open the app on your desk: everything works. The API responds. You have no idea which of those three reports is even the same bug.\n\nThat confusion is not a networking gap, it is a *model* gap. Right now every failure between your app and a server collapses into one undifferentiated sentence: \"the backend is broken.\" A request actually travels through six distinct stages, and each one fails in a way that looks different on the client. Once you can name the stages, a support message stops being noise and starts pointing at a layer.\n\n## The idea\n\nCalling `fetch()` is placing a phone call to a company's support line.\n\nFirst you look up the number in your contacts — that is **DNS**, turning `api.example.com` into an IP address. Then the line rings and both sides say \"hello, are you there?\" before anyone talks — that is the **TCP handshake**. Then you both switch on a scrambler you each own so nobody on the line can listen in, and you check the other side's ID badge — that is **TLS**, which is the S in HTTPS. Only now do you speak, and you speak to a script they published: \"account number first, then your request\" — that is **HTTP**.\n\nOn the other end is not a building. It is a **process**: a program someone wrote, running on a machine that stays on, which asked the operating system for a port number and has been sitting in a loop waiting for calls. That is the whole mystery of \"a server.\" You already write the client half every day. The server half is a program with the same kind of event loop, listening instead of calling.\n\n## In practice\n\nHere is the call you have written a hundred times.\n\n```ts\nconst res = await fetch(\"https://api.example.com/v1/notes\", {\n  method: \"GET\",\n  headers: { Authorization: `Bearer ${token}` },\n});\nconst notes = await res.json();\n```\n\nBetween the `await` and the response, this happens:\n\n1. **DNS** — resolve `api.example.com` to something like `203.0.113.10`. Cached on the device, so usually free; occasionally stale for exactly one user.\n2. **TCP** — open a connection to port 443 on that IP. Three packets, one round trip.\n3. **TLS** — the server presents a certificate, both sides agree on keys. One or two more round trips. This is why the *first* request on a cold connection is slower than the next twenty.\n4. **HTTP request** — method, path, headers, body, sent as bytes through the encrypted tunnel.\n5. **Your server process** — accepts the connection, matches the path to a handler, runs code, probably queries a database.\n6. **HTTP response** — status line, headers, body come back. The connection stays open (keep-alive) so the next call skips stages 1 to 3.\n\nNow the payoff. Match the symptom to the stage:\n\n| What you see on the client | Stage to suspect |\n|---|---|\n| Instant \"Network request failed\", other apps fine | DNS, or no route to that host at all |\n| Hangs, then times out after 30s | Connection blocked, or the server accepted and never answered |\n| 502 or 503 | The proxy was reached; your app process is down, crashing, or restarting |\n| 504 | Proxy waited for your app and gave up; something is too slow |\n| 401 or 403 | Your code ran; auth logic said no |\n| 400 or 422 | Your code ran; the payload was wrong |\n| 500 | Your code ran and threw |\n| CORS error in a browser console | The response arrived; the browser refused to let JS read it |\n\nTwo of these are worth memorising. **500 versus 502**: a 500 means your code executed and raised an error, so there is a stack trace in your logs. A 502 means the proxy in front of your app could not get a valid response out of the process at all, so there is often *nothing* in your app logs — look at whether the process is alive. **CORS** is a browser rule, not a server failure. Native apps and `curl` ignore it entirely, and a CORS error almost always means the request did reach the server.\n\nYou can watch every stage from a terminal:\n\n```bash\ndig +short api.github.com\n\ncurl -v https://api.github.com/zen\n\ncurl -o /dev/null -s -w \"dns:%{time_namelookup} tcp:%{time_connect} tls:%{time_appconnect} ttfb:%{time_starttransfer} total:%{time_total}\\n\" https://api.github.com/zen\n```\n\nThe third command is the one to keep. When someone says \"the API is slow,\" those five numbers tell you whether it is the network or your code, before you open a single file.\n\n## In your world\n\nYour work backend runs as three processes behind a domain, so a request from the mobile app hits a proxy first and your API process second. That layout explains a class of incident you have probably witnessed without decoding: a deploy goes out with a bad environment variable, the process crashes on boot, and every user gets a 502. Your app's error handler has nothing useful to show because your code never ran — there is no error to report, only an absence. The fix is never in the app.\n\nYou will meet the smaller version of this tomorrow. When you start a server on port 3000 and open `localhost:3000` from the iOS simulator, it works, because the simulator shares your Mac's network. Do the same on a physical Android phone and it fails, because `localhost` on that phone means *that phone*. Nothing is wrong with your server. You dialled the wrong number. Recognising that as a stage-1 problem instead of a code problem is the entire skill this module is teaching.\n\n## Watch out\n\n- `localhost` is relative to whoever says it. Physical devices need your Mac's LAN IP; the Android emulator reaches the host at `10.0.2.2`.\n- A timeout is not a message from the server. Nobody answered. Searching your application logs for it is usually wasted time — check first whether the process is running.\n- HTTPS proves the tunnel is private and the server is who it claims. It proves nothing about the caller. Encryption is not authentication.\n- Keep-alive means your timing measurements lie if you only run them once. The first request pays for DNS, TCP, and TLS; the rest do not.",
+      "tasks": [
+        "Run the curl timing command from the lesson against https://api.github.com/zen twice in a row. Write down which phase dominated and why the second run is faster.",
+        "Run `curl -v https://api.github.com/zen` and label three things in the output: the TLS handshake lines, the request line you sent, and the response status line.",
+        "Produce two different failures on purpose: `curl -v https://not-a-real-host.invalid` and `curl -v http://localhost:9999`. Write down how the two error messages differ and which stage each one failed at.",
+        "Take one real network failure your app has had (Sentry, a support ticket, or memory) and place it on the symptom table. Say what you would check first and second.",
+        "Write the symptom-to-stage table from memory in your own notes, then compare against the lesson and fix what you got wrong."
+      ],
+      "quiz": [
+        {
+          "q": "Your app returns 'Network request failed' instantly, while a browser on the same phone loads other sites fine. Which stage do you suspect first?",
+          "options": [
+            "DNS resolution, or no route to that host at all",
+            "Your route handler threw an exception",
+            "The database query is slow",
+            "A CORS misconfiguration on the server"
+          ],
+          "answer": 0,
+          "explain": "An instant failure means the request never got far enough to be answered. Nothing was sent and nothing timed out, which points at name resolution or reachability, not at your code."
+        },
+        {
+          "q": "A request hangs for 30 seconds and then times out on the client. What does that tell you?",
+          "options": [
+            "The server returned a 504",
+            "Your error handler formatted the response badly",
+            "Nobody sent a response: the process may be dead, blocked, or unreachable",
+            "The client sent an invalid body"
+          ],
+          "answer": 2,
+          "explain": "A timeout is the absence of an answer, not a message from the server. There is no status code and often nothing in your application logs, so check first whether the process is alive and responsive."
+        },
+        {
+          "q": "What is the difference between a 500 and a 502?",
+          "options": [
+            "They are interchangeable; different proxies pick different numbers",
+            "500 means your code ran and threw; 502 means the proxy could not get a valid response out of your process at all",
+            "502 always means DNS failed",
+            "500 is a client error and 502 is a server error"
+          ],
+          "answer": 1,
+          "explain": "A 500 leaves a stack trace in your logs because your handler executed. A 502 often leaves nothing, because the process was down, crashing, or restarting when the proxy tried to reach it."
+        },
+        {
+          "q": "A teammate reports that the mobile app is getting a CORS error. What is the right reaction?",
+          "options": [
+            "Add the cors() middleware and the mobile bug is fixed",
+            "CORS is enforced by browsers, so a native app ignores it: the report is about a web client or a misread error message",
+            "CORS errors mean the request never left the device",
+            "A CORS error is a TLS handshake failure"
+          ],
+          "answer": 1,
+          "explain": "CORS is a browser rule about which origins may read a response. Native apps and curl ignore it entirely, and a genuine CORS error means the request did reach the server."
+        },
+        {
+          "q": "Your endpoint is served over HTTPS. What does that guarantee?",
+          "options": [
+            "The caller is authenticated",
+            "The request body is valid",
+            "The bytes in transit are encrypted and the server's identity is verified; it says nothing about who is calling",
+            "You no longer need auth tokens for that endpoint"
+          ],
+          "answer": 2,
+          "explain": "TLS protects the tunnel and proves the server is who it claims to be. Identifying the caller is authentication, a completely separate job that happens inside your code."
+        }
+      ],
+      "resources": [
+        {
+          "label": "MDN — An overview of HTTP",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Overview"
+        },
+        {
+          "label": "MDN — HTTP reference",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP"
+        },
+        {
+          "label": "MDN — Cross-Origin Resource Sharing (CORS)",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS"
+        },
+        {
+          "label": "roadmap.sh — Backend developer roadmap",
+          "url": "https://roadmap.sh/backend"
+        }
+      ]
+    },
+    "m0-2": {
+      "content": "## The problem\n\nA user checks out on a train. He taps \"Place order\", the tunnel arrives, the spinner keeps spinning, and your app's 10-second timeout fires. Your networking layer does the sensible thing and retries. Two minutes later he has one order in his history and two charges on his card.\n\nNothing in that story is a bug in your retry code. The retry was correct. The bug is that `POST /orders` means \"create another order,\" and you asked twice. The server never got a chance to know it was the same intent. The reverse mistake costs you differently: you spend an hour reading server code because your dashboard shows a spike of 500s, and the client was sending a malformed body all along. A 500 said \"my fault\" when it should have said \"yours.\" Status codes are how two teams that never talk assign blame correctly.\n\n## The idea\n\nHTTP is a contract language with a deliberately small vocabulary. The **method** says what kind of operation this is. The **status code** says what happened and who owns the problem. **Headers** carry metadata about the message. The **body** carries the data.\n\nYou already trust a contract like this: the props of a shared component. If both sides agree on the shape, neither has to read the other's source. HTTP is that agreement standardised, so a proxy, a CDN, a monitoring tool, and your app can all reason about a request none of them wrote.\n\nTwo words carry most of the weight. A method is **safe** if it changes nothing on the server. A method is **idempotent** if doing it five times leaves the server in the same state as doing it once. Idempotent does not mean \"returns the same response\" — it means the *effect* does not accumulate.\n\n## In practice\n\n| Method | Safe | Idempotent | Means |\n|---|---|---|---|\n| GET | yes | yes | read something |\n| POST | no | no | create something, or trigger an action |\n| PUT | no | yes | replace the thing at this known id |\n| PATCH | no | no | partially update the thing at this id |\n| DELETE | no | yes | remove the thing at this known id |\n\nRead the DELETE row carefully, because it is where people get confused. `DELETE /notes/42` twice gives you a 204 and then a 404. Different status codes, same end state: note 42 is gone. That is exactly what idempotent means, and it is why a retry of a DELETE is harmless while a retry of a POST is not.\n\nSo how do you make a POST safe to retry? You give the *intent* an id, generated by the client at the moment the user acts.\n\n```ts\n// generated once, when the user taps the button — NOT inside the retry loop\nconst idempotencyKey = randomUUID();\n\nawait fetch(`${API}/orders`, {\n  method: \"POST\",\n  headers: {\n    \"Content-Type\": \"application/json\",\n    \"Idempotency-Key\": idempotencyKey,\n  },\n  body: JSON.stringify({ cartId, totalCents }),\n});\n```\n\nThe server stores the key with the result it produced. On a replay it recognises the key and returns the stored response instead of charging again. Regenerating the key inside the retry makes every attempt look like a fresh intent, which is the same bug with extra ceremony. Stripe's API works exactly this way, and now you know why.\n\nStatus codes come in families, and the family is the important part:\n\n| Family | Meaning | Who fixes it |\n|---|---|---|\n| 2xx | it worked | nobody |\n| 3xx | look somewhere else | the client follows the pointer |\n| 4xx | the request was wrong | the caller |\n| 5xx | the server broke on a valid request | you |\n\nThe ones worth knowing cold when you are the one writing the API:\n\n- **200** OK with a body. **201** Created, plus a `Location` header pointing at the new resource. **204** No Content, for a successful delete or an update with nothing to say.\n- **400** malformed or failed validation. **422** well-formed but semantically impossible (a valid date that is in the past when it must be future).\n- **401** versus **403**: 401 means \"I do not know who you are\" — no credentials, or expired ones. 403 means \"I know exactly who you are and you may not do this.\" Your app's token-refresh interceptor should retry on 401 and must never retry on 403, because retrying a 403 is an infinite loop that logs the user out for no reason.\n- **404** not found. **409** conflict — duplicate email, or a version clash on a concurrent edit. **429** too many requests, always with a `Retry-After` header so the client knows how long to wait.\n- **500** you threw. **503** you are alive but not ready (starting up, dependency down).\n\nHeaders you will actually use: `Content-Type` (what the body is), `Authorization` (who is asking), `Accept` (what the caller can read), `Cache-Control` and `ETag` (how long this may be reused), `Retry-After`, and `Idempotency-Key`.\n\nOne rule to carry into every API you write: **never return 200 with an error inside the body.**\n\n```ts\n// bad: the transport says success, the payload says failure\nres.status(200).json({ ok: false, message: \"note not found\" });\n\n// good: the status is the answer, the body explains it\nres.status(404).json({ error: \"note_not_found\", noteId: id });\n```\n\nThe first version forces every caller to parse a body to learn whether the call worked, and it blinds your proxy, your retry logic, your dashboards, and your alerting. All of those read the status code. None of them read your JSON.\n\n## In your world\n\nYour practice projects give you both sides of this immediately. In task-manager-api, updating a task is where PUT and PATCH separate: PUT replaces the whole task (send every field, twice is fine), PATCH toggles `completed`. In marketplace-api, order creation is literally the double-charge story above, and it is where you will implement an idempotency key against a real payment flow rather than reading about one.\n\nAt work the contract is enforced by schema: routes declare their request shape and the status codes they can return, and that declaration generates the API description your mobile app consumes. So 4xx-versus-5xx discipline is not an academic preference — it *is* the quality of your own app's error messages. A route that throws an unmodelled error becomes a 500, your app shows the generic \"something went wrong,\" and the user learns nothing. A route that returns a 409 with `{ error: \"email_taken\" }` lets your app say the one sentence that helps.\n\n## Watch out\n\n- Mixing up 401 and 403 makes your app log people out when they merely lacked permission.\n- A retry after a network failure is not safe just because the request *looked* failed. The server may have processed it and the response may have been lost on the way back. That ambiguity is unavoidable, which is why the idempotency key exists.\n- PATCH is not idempotent unless you design it to be. A body that says \"increment views by 1\" accumulates on every retry.\n- Returning 404 instead of 403 to avoid leaking whether a resource exists is a legitimate choice. Make it deliberately and document it, do not stumble into it.",
+      "tasks": [
+        "Write the five-method table with safe and idempotent columns from memory, then check it against the MDN methods reference and correct it.",
+        "Pick three endpoints your app calls today. For each, judge whether the method is right, whether the status codes are honest, and whether a retry is safe.",
+        "Find one place in your app where a POST can be sent twice (timeout retry, pull-to-refresh, a double-tappable button) and write the two-line plan for making it idempotent.",
+        "curl a real API for one 200, one 404, and one 401 (send a deliberately bad token). Record the body shape each one returns.",
+        "Write down the single error-response shape you will use for every project in this course: the field for the machine-readable code, the human message, and the field-level issues."
+      ],
+      "quiz": [
+        {
+          "q": "You send `DELETE /notes/42` twice. The first returns 204, the second returns 404. Is DELETE still idempotent?",
+          "options": [
+            "No, because the status codes differ",
+            "Yes: idempotent is about the resulting state, not the response, and note 42 is gone either way",
+            "Only if the server returns 204 both times",
+            "Idempotency does not apply to DELETE"
+          ],
+          "answer": 1,
+          "explain": "Idempotent means repeating the request does not change the outcome further. The second call finds nothing to delete and says so, which is why retrying a DELETE is safe."
+        },
+        {
+          "q": "Which of these is NOT idempotent?",
+          "options": [
+            "PUT /notes/42 with the full replacement body",
+            "GET /notes/42",
+            "PATCH /notes/42 with a body meaning 'add 1 to the view count'",
+            "DELETE /notes/42"
+          ],
+          "answer": 2,
+          "explain": "A relative update accumulates: five retries add five views. PATCH is only idempotent if you design its body to describe an absolute end state."
+        },
+        {
+          "q": "Your app's interceptor refreshes the token and retries on failure. Which status must it never retry?",
+          "options": [
+            "401, because the token is expired",
+            "403, because the server already knows who you are and is refusing on purpose",
+            "429, because you are rate limited",
+            "500, because the server broke"
+          ],
+          "answer": 1,
+          "explain": "403 means authenticated but not permitted, so refreshing the token changes nothing. Retrying it loops, and treating it like a 401 logs the user out for no reason."
+        },
+        {
+          "q": "Why should an API never return 200 with `{ ok: false }` in the body?",
+          "options": [
+            "It uses more bandwidth",
+            "Proxies, retries, monitoring, and alerting all read the status code and would treat the failure as a success",
+            "JSON bodies are not allowed on error responses",
+            "It breaks TLS"
+          ],
+          "answer": 1,
+          "explain": "The status code is the part of the response that every layer between you and the client understands. Hiding failure in the body blinds all of them, and forces each caller to parse a body to learn whether the call worked."
+        },
+        {
+          "q": "Where should an idempotency key be generated?",
+          "options": [
+            "On the server, once per received request",
+            "In the client, once per user intent, and reused by every retry of that intent",
+            "In the client, freshly inside each retry attempt",
+            "By the load balancer"
+          ],
+          "answer": 1,
+          "explain": "The key identifies the intent, not the transmission. Generating a new one per attempt makes every retry look like a new order, which is the exact bug it was supposed to prevent."
+        }
+      ],
+      "resources": [
+        {
+          "label": "MDN — HTTP request methods",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods"
+        },
+        {
+          "label": "MDN — HTTP response status codes",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Status"
+        },
+        {
+          "label": "MDN — Idempotent (glossary)",
+          "url": "https://developer.mozilla.org/en-US/docs/Glossary/Idempotent"
+        },
+        {
+          "label": "Stripe — Idempotent requests",
+          "url": "https://docs.stripe.com/api/idempotent_requests"
+        },
+        {
+          "label": "roadmap.sh — API design",
+          "url": "https://roadmap.sh/api-design"
+        }
+      ]
+    },
+    "m0-3": {
+      "content": "## The problem\n\nEvery `fetch()` you have ever written pointed at something somebody else built. When it returned 400 you read their docs. When it returned 500 you filed a ticket and waited. In standup someone asks whether the profile endpoint could also return the user's follower count, and you cannot answer — not because it is hard, but because you have never opened the file where the answer lives.\n\nToday that file becomes yours. By the end of this module the other side of `fetch()` is thirty lines of TypeScript you wrote, running on your laptop, and you will have called it from a terminal and from a real app. The mystery does not survive this.\n\n## The idea\n\nA server is a program stuck in a loop.\n\nIt starts up, asks the operating system for a port, and then blocks: waiting. When a connection arrives it wakes, reads the bytes, decides what to do, writes bytes back, and goes back to waiting. That is all. There is no daemon magic and no special language.\n\nThe closest thing in your world is an event listener that never unmounts. `app.get(\"/notes\", handler)` is `addEventListener(\"GET /notes\", handler)` — you register a callback and something else calls it when the event happens. And Node runs on the same kind of single-threaded event loop as the JS thread in your app, which means the same cardinal sin applies: block it and *everything* stops. In RN, a heavy synchronous loop drops frames for one user. On a server, it freezes every request from every user at once.\n\nA **port** is the apartment number at a street address. The IP gets you to the machine; the port gets you to the specific process. Only one process can hold a port at a time, which is what `EADDRINUSE` is telling you.\n\n## In practice\n\nScaffold it:\n\n```bash\nmkdir hello-api && cd hello-api\nnpm init -y\nnpm i express\nnpm i -D typescript tsx @types/express @types/node\nnpx tsc --init\n```\n\nBefore Express, see what Express is hiding. This is a complete HTTP server using nothing but Node:\n\n```ts\nimport { createServer } from \"node:http\";\n\nconst server = createServer((req, res) => {\n  res.writeHead(200, { \"Content-Type\": \"application/json\" });\n  res.end(JSON.stringify({ ok: true, method: req.method, path: req.url }));\n});\n\nserver.listen(3000);\n```\n\nRun it, curl it, and notice what you do *not* have: no routing (every path hits the same function), no JSON body parsing, no way to compose behaviour. Express is a library that adds those three things on top of exactly this. Knowing that keeps `app.get` from feeling like a framework incantation.\n\nNow the Express version:\n\n```ts\nimport express from \"express\";\n\nconst app = express();\napp.use(express.json()); // turns a JSON request body into req.body\n\napp.get(\"/health\", (_req, res) => {\n  res.status(200).json({ status: \"ok\" });\n});\n\napp.get(\"/greet/:name\", (req, res) => {\n  const { name } = req.params;             // path param, always a string\n  const loud = req.query.loud === \"true\";  // query param, also always a string\n  const message = `hello ${name}`;\n  res.json({ message: loud ? message.toUpperCase() : message });\n});\n\napp.post(\"/echo\", (req, res) => {\n  res.status(201).json({ youSent: req.body });\n});\n\napp.listen(3000);\n```\n\nThree kinds of input, and it is worth naming which is which. `/greet/:name` puts data in the **path** — use it to identify a resource. `?loud=true` puts data in the **query string** — use it for filters, sorting, pagination. The POST body carries the data you are creating. Getting these three habits right now saves you a redesign in phase 4.\n\nHit all of it from a terminal:\n\n```bash\ncurl -i http://localhost:3000/health\ncurl -i \"http://localhost:3000/greet/aswin?loud=true\"\ncurl -i -X POST http://localhost:3000/echo \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"hi\":1}'\n```\n\nThen run that last one again with the `-H` line deleted. `req.body` comes back `undefined` — not `{}`. That is because `express.json()` only parses a body when the `Content-Type` says JSON, and it is a mystery that has cost people entire afternoons. You now recognise it in ten seconds.\n\nOne more sharp edge, visible in the code above: query params are strings.\n\n```ts\nconst limit = Number(req.query.limit); // \"20\" becomes 20, absent becomes NaN\n```\n\n`req.query.limit` is `\"20\"`, never `20`, and it is `undefined` when omitted, so `Number()` hands you `NaN` and your slice returns nothing. Tomorrow you will fix this properly with schema coercion instead of hand-written casts.\n\nFinally, call it from a real app:\n\n```ts\nconst res = await fetch(\"http://192.168.1.20:3000/greet/aswin?loud=true\");\nconst data = await res.json();\n```\n\nNote the LAN IP. From a physical device, `localhost` means the device. From the Android emulator, the host machine is `10.0.2.2`. And recent Android targets block plain HTTP by default, so a cleartext LAN call may need a debug network-security config — that is a known hurdle, not a bug in your server.\n\n## In your world\n\nThat file is the shape underneath all five of your practice projects. `GET /tasks?status=open&limit=20` in task-manager-api is this file plus auth, plus validation, plus a database — and nothing conceptually new. The next four days add those layers one at a time on top of what you just typed.\n\nYour work backend swaps Express for Hono and Node for Bun, and the translation is almost mechanical: `app.get(\"/path\", handler)`, a param read off the request context, a JSON response returned rather than written. The three questions a handler answers never change: which method and path is this, what did the caller send, what do I send back. Learning Express first means Hono arrives as new vocabulary rather than a new idea.\n\n## Watch out\n\n- Send exactly one response per handler, then return. Two `res.json()` calls give you \"Cannot set headers after they are sent\", and it is usually a missing `return` on an early exit.\n- Route order matters. Declare `/notes/new` *before* `/notes/:id`, or `:id` swallows the word \"new\".\n- Any synchronous heavy loop blocks every request from every user. Same event-loop rule you know from the JS thread, much higher stakes.\n- A forgotten `await` in a handler leaves the client hanging until its timeout, with no error anywhere. Tomorrow's module makes that failure mode explicit.",
+      "tasks": [
+        "Scaffold hello-api with express, typescript and tsx, and get it listening on port 3000.",
+        "Write the raw node:http server first, curl it, then write down the three things Express adds on top of it.",
+        "Implement GET /health, GET /greet/:name with a loud query param, and POST /echo. curl all three with -i and record the status codes.",
+        "POST to /echo without the Content-Type header. Record what req.body is and explain why it is that and not an empty object.",
+        "Call your server from a real app or the iOS simulator using localhost, then from a physical device using your Mac's LAN IP. Note what breaks and why.",
+        "Cause EADDRINUSE deliberately by starting the server twice, then find and kill the first process with lsof instead of changing ports.",
+        "Declare /notes/:id before /notes/new, request /notes/new, and record which handler actually ran."
+      ],
+      "quiz": [
+        {
+          "q": "What is a 'server' in the most literal sense?",
+          "options": [
+            "A machine in a data centre",
+            "A program that holds a port and waits in a loop for connections",
+            "A framework like Express",
+            "A container image"
+          ],
+          "answer": 1,
+          "explain": "It is a process, not a place. It asks the OS for a port and blocks until a connection arrives, which is why 'the server is down' usually means one program exited."
+        },
+        {
+          "q": "A client requests /notes?limit=20. What is the type of req.query.limit?",
+          "options": [
+            "number, because Express parses numeric query values",
+            "string, always: URL values arrive as text and may also be undefined or an array",
+            "number | undefined",
+            "It depends on the Content-Type header"
+          ],
+          "answer": 1,
+          "explain": "Everything in a URL is text. Number(req.query.limit) gives NaN when the param is missing, which is why day 5 replaces hand-written casts with schema coercion."
+        },
+        {
+          "q": "Your server fails to start with EADDRINUSE. What happened?",
+          "options": [
+            "The port number is above the allowed range",
+            "Another process, usually a previous run of your own server, already holds that port",
+            "Your firewall blocked the port",
+            "Express needs the port declared in package.json"
+          ],
+          "answer": 1,
+          "explain": "One process per port. Find the old one (lsof -i :3000) and kill it, rather than moving to a new port each time and losing track of what is running."
+        },
+        {
+          "q": "You declare app.get('/notes/:id') above app.get('/notes/new'). What happens on GET /notes/new?",
+          "options": [
+            "Express prefers the more specific literal route",
+            "The :id handler runs with id set to the string 'new'",
+            "Express returns a 404",
+            "Both handlers run in order"
+          ],
+          "answer": 1,
+          "explain": "Routes match top to bottom, first match wins, and :id matches any single segment. Literal paths must be declared before the parameterised route that would swallow them."
+        },
+        {
+          "q": "Your API works from the iOS simulator at localhost:3000 but not from a physical Android phone on the same wifi. Why?",
+          "options": [
+            "Android does not support fetch",
+            "localhost on the phone means the phone; the phone needs your Mac's LAN IP (and the emulator reaches the host at 10.0.2.2)",
+            "Express only binds to IPv6",
+            "The server needs HTTPS before any device can call it"
+          ],
+          "answer": 1,
+          "explain": "localhost is relative to whoever says it. This is a stage-1 addressing problem, not a bug in your server, and recognising the difference is the point of day 1."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Express — Hello world",
+          "url": "https://expressjs.com/en/starter/hello-world.html"
+        },
+        {
+          "label": "Express — Routing guide",
+          "url": "https://expressjs.com/en/guide/routing.html"
+        },
+        {
+          "label": "Node.js — HTTP module API",
+          "url": "https://nodejs.org/api/http.html"
+        },
+        {
+          "label": "MDN — Using the Fetch API",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch"
+        }
+      ]
+    },
+    "m0-4": {
+      "content": "## The problem\n\nA request hangs. Your app shows a spinner until the 30-second timeout fires. You check the server: the process is healthy, CPU is flat, and the log shows the request *arriving* and then nothing. No error. No stack trace. No 500. Nothing crashed. A function in the middle of the chain simply looked at the request and never passed it on, and there is no mechanism anywhere that notices.\n\nThe same week, a different flavour. A route throws. Instead of the JSON error shape your app knows how to display, the client receives an HTML page with a stack trace in it, and your app's error parser blows up trying to `JSON.parse` it. Your error handler is right there in the file and it never ran, because it was registered above the routes instead of below them.\n\nBoth of these are ordering bugs in a pipeline you have not yet learned to see.\n\n## The idea\n\nEvery request walks down a line of stations. Each station gets the request, and can do one of four things: inspect it, modify it, answer it and stop, or hand it down the line. In Express a station is a function with the signature `(req, res, next)`, and handing it down is calling `next()`.\n\nYou already know this pattern. Redux middleware: `dispatch` walks `logger → thunk → reducer`, each middleware receives the action and either calls `next(action)` or short-circuits. Express is the same design applied to HTTP requests instead of actions.\n\nTwo facts explain almost every middleware bug you will ever write:\n\n1. **The line is ordered by registration**, top to bottom in your file.\n2. **Each station either sends a response or calls `next()`. Exactly one, exactly once.**\n\nSend a response *and* call `next()` and the next station tries to write to a finished response. Do neither and the request hangs until the client gives up.\n\n## In practice\n\nA request logger. Notice it cannot log the status immediately — it has to wait for the response to finish.\n\n```ts\nimport type { Request, Response, NextFunction } from \"express\";\n\nexport function requestLog(req: Request, res: Response, next: NextFunction) {\n  const startedAt = Date.now();\n  res.on(\"finish\", () => {\n    logger.info({\n      method: req.method,\n      path: req.path,\n      status: res.statusCode,\n      ms: Date.now() - startedAt,\n    });\n  });\n  next();\n}\n```\n\nAuth. This one short-circuits, which is the whole point of it:\n\n```ts\nexport function requireAuth(req: Request, res: Response, next: NextFunction) {\n  const header = req.header(\"authorization\");\n  if (!header?.startsWith(\"Bearer \")) {\n    return res.status(401).json({ error: \"missing_bearer_token\" });\n  }\n\n  const user = verifyToken(header.slice(\"Bearer \".length));\n  if (!user) {\n    return res.status(401).json({ error: \"invalid_token\" });\n  }\n\n  req.user = user; // everything downstream can now rely on this\n  next();\n}\n```\n\nThose two `return` keywords are not style. Without them, execution falls through to `next()` and you both answer the request and pass it on — a response already sent, plus a route handler running against a dead `res`.\n\n`req.user` needs a type, and the answer is not `any`. Express's `Request` is an interface, so you extend it:\n\n```ts\ndeclare global {\n  namespace Express {\n    interface Request {\n      user?: { id: string; role: \"user\" | \"admin\" };\n    }\n  }\n}\n```\n\nThe error handler. Express identifies it by **arity** — four parameters instead of three — which is why the unused ones must still be declared:\n\n```ts\nimport type { ErrorRequestHandler } from \"express\";\n\nexport const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {\n  const status = err instanceof HttpError ? err.status : 500;\n  if (status >= 500) logger.error({ err }, \"unhandled_error\");\n  res.status(status).json({\n    error: status >= 500 ? \"internal_error\" : err.message,\n  });\n};\n```\n\nNever send `err.stack` to a client. It tells an attacker your file paths, your dependency versions, and often your query shapes.\n\nNow assemble the line. This order is not arbitrary — read the comments as rules:\n\n```ts\nconst app = express();\n\napp.use(helmet());                        // security headers on every response\napp.use(cors({ origin: allowedOrigins })); // before routes, so preflights are answered\napp.use(express.json());                  // before anything that reads req.body\napp.use(requestLog);                      // early, so it times everything below\n\napp.use(\"/health\", healthRouter);          // public on purpose\napp.use(\"/api/notes\", requireAuth, notesRouter); // auth guards this whole subtree\n\napp.use(notFound);                        // nothing above matched\napp.use(errorHandler);                    // LAST. always last.\n```\n\n`requireAuth` mounted next to the router is the important line: every route inside `notesRouter` is protected by construction, not by each handler remembering. Protection you can forget is not protection.\n\nA word on CORS, since it confuses people who come from mobile. CORS is a set of response headers that tell a *browser* which origins are allowed to read a response. It is enforced by the browser, not the server. Your app and `curl` ignore it completely. Adding `cors()` will never fix a native networking bug.\n\nThe last trap is version-specific and catches everyone. In Express 4, a rejected promise inside an `async` handler does **not** reach your error handler — it becomes an unhandled rejection and the client hangs. Express 5 forwards it. Until you are sure which you are on, catch and forward by hand:\n\n```ts\napp.get(\"/notes/:id\", async (req, res, next) => {\n  try {\n    res.json(await getNote(req.params.id));\n  } catch (err: unknown) {\n    next(err); // passing an argument jumps straight to the error handler\n  }\n});\n```\n\n## In your world\n\nEvery one of your five projects gets the same spine: helmet, cors, JSON parsing, request logging, auth on the protected routers, a 404 handler, and the error handler last. task-manager-api's Supabase JWT middleware is `requireAuth` above with real token verification instead of a stub, and it lands on day 11.\n\nYour work backend runs the identical pipeline in Hono's vocabulary: an auth middleware mounted on route groups, a role middleware layered after it, and — the one worth staring at — a middleware that attaches a request-scoped database handle to the request context. That is the same move as `req.user`: enrich the request once, and everything downstream reads it from there. It is also why handlers must use the injected handle rather than importing a database pool directly. The middleware is what makes the request's identity travel with it, and a handler that reaches around the pipeline for its own connection quietly drops the caller's identity on the floor.\n\n## Watch out\n\n- A middleware that forgets `next()` hangs forever with zero output anywhere. Run today's trap so you recognise the silence.\n- An error handler registered above the routes never fires. Errors below it have nowhere to go.\n- `next()` continues the line; `next(err)` skips everything remaining and jumps to the error handler. Passing a value is a control-flow decision.\n- Ordering pairs that always matter: body parsing before anything reading `req.body`, CORS before routes, auth before the routes it protects, error handler dead last.",
+      "tasks": [
+        "Write requestLog, requireAuth, notFound and errorHandler as separate files, then assemble app.ts in the exact order from the lesson.",
+        "Type req.user by augmenting Express's Request interface. Do it without using any.",
+        "Run today's trap in full, including the async rejection, and write the three-line symptom lookup table it asks for.",
+        "Mount requireAuth on a router so every route inside it is protected by construction, then prove with curl that /health is public and the protected route returns 401.",
+        "Delete the `return` in front of one res.status(401) call, hit that route, and record the second error Express reports. Put the return back.",
+        "Send a request with a valid token and confirm your log line contains the method, path, status and duration for exactly one request."
+      ],
+      "quiz": [
+        {
+          "q": "A middleware inspects the request, decides everything is fine, and returns without calling next() or sending a response. What does the client see?",
+          "options": [
+            "A 500 with a stack trace",
+            "Nothing: the request hangs until the client times out, and no error is logged anywhere",
+            "A 404 from the not-found handler",
+            "Express calls next() automatically after the function returns"
+          ],
+          "answer": 1,
+          "explain": "Nothing went wrong, so nothing is reported. The request simply stops moving. This is the failure mode with the worst signal-to-effort ratio in Express, which is why you trigger it deliberately today."
+        },
+        {
+          "q": "Where must the error handler be registered?",
+          "options": [
+            "First, so it can catch everything below it",
+            "Last, after all routes: middleware runs in registration order and errors travel forward, not backward",
+            "Anywhere, Express finds it by name",
+            "Twice, once at the top and once at the bottom"
+          ],
+          "answer": 1,
+          "explain": "The pipeline is ordered top to bottom. An error handler above the routes is never reached, and you get Express's default HTML error page instead of your JSON shape."
+        },
+        {
+          "q": "How does Express know a function is an error handler rather than normal middleware?",
+          "options": [
+            "It checks the function name",
+            "By its arity: four parameters (err, req, res, next)",
+            "You register it with app.error()",
+            "It must be exported as default"
+          ],
+          "answer": 1,
+          "explain": "Four declared parameters is the signal, which is why you keep the unused ones in the signature instead of trimming them."
+        },
+        {
+          "q": "Your native app gets a network error and someone suggests adding cors(). What is true?",
+          "options": [
+            "CORS headers are needed by every HTTP client",
+            "CORS is enforced by browsers only, so adding it cannot fix a native-client problem",
+            "cors() also enables preflight for mobile apps",
+            "CORS must be registered after the routes"
+          ],
+          "answer": 1,
+          "explain": "CORS headers tell a browser which origins may read a response. Native clients and curl ignore them, so a CORS change is invisible to your app."
+        },
+        {
+          "q": "What is the difference between next() and next(err)?",
+          "options": [
+            "Nothing; the argument is ignored",
+            "next() continues to the next station in the line; next(err) skips the remaining stations and jumps to the error handler",
+            "next(err) retries the request",
+            "next(err) sends a 500 immediately and ends the response"
+          ],
+          "answer": 1,
+          "explain": "Passing a value is a control-flow decision: everything between here and the error handler is skipped. That is how you forward a caught async error deliberately."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Express — Using middleware",
+          "url": "https://expressjs.com/en/guide/using-middleware.html"
+        },
+        {
+          "label": "Express — Writing middleware",
+          "url": "https://expressjs.com/en/guide/writing-middleware.html"
+        },
+        {
+          "label": "Express — Error handling",
+          "url": "https://expressjs.com/en/guide/error-handling.html"
+        },
+        {
+          "label": "MDN — Cross-Origin Resource Sharing (CORS)",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS"
+        }
+      ],
+      "trap": {
+        "title": "The request that hangs forever",
+        "content": "Do this on purpose, today, on your hello API. You are training pattern recognition for a failure that gives you no error message at 3am.\n\n**Part 1 — the request that hangs forever.**\n\nAdd this middleware above your routes:\n\n```ts\napp.use((req, res, next) => {\n  logger.info({ path: req.path }, \"incoming\");\n  if (req.header(\"x-debug\") === \"1\") {\n    return next();\n  }\n  // the happy path forgets to call next()\n});\n```\n\nNow `curl -i http://localhost:3000/health` and watch. Note carefully what you observe:\n\n- curl sits there. No status line, no body, no connection close.\n- The log shows `incoming` and then *nothing*.\n- The process is healthy. CPU is idle. Nothing crashed.\n- There is no error, no stack trace, no 500 — because nothing went wrong. A function just... ended.\n\nThen send `-H \"x-debug: 1\"` and watch it work, which is what makes this so evil in production: it only hangs on some requests.\n\n**Part 2 — the error handler that never fires.**\n\nMove `app.use(errorHandler)` to *above* your route registrations. Add a route that throws:\n\n```ts\napp.get(\"/boom\", () => {\n  throw new Error(\"kaboom\");\n});\n```\n\nHit it. You get Express's default handler: a 500 with an HTML page containing a stack trace, not your JSON error shape. Your handler is loaded, correct, and unreachable. Now move it back below the routes and hit `/boom` again.\n\n**Part 3 — the async rejection.**\n\n```ts\napp.get(\"/boom-async\", async () => {\n  throw new Error(\"kaboom later\");\n});\n```\n\nHit it and record what your Express version does: forwards to your error handler (Express 5) or hangs with an unhandled rejection warning in the console (Express 4). Then wrap it in try/catch with `next(err)` and confirm it behaves.\n\n**The deliverable.** Write three lines in your notes, one per failure, in the form *\"symptom on the client + what the logs show = this cause.\"* You are building a lookup table. The next time a request hangs with silent logs, you will not spend forty minutes adding print statements — you will grep for a middleware with no `next()`."
+      }
+    },
+    "m0-5": {
+      "content": "## The problem\n\nThree pages, three different nights, one root cause.\n\nA client sends `{ \"title\": null }` because a text input was cleared and your app spread an undefined into the payload. Your handler calls `title.trim()`. TypeError, 500, alert fires. The user sees \"something went wrong\" and cannot create a task, and the truth — his request was invalid — was known at the very first line of your code and nobody said it out loud.\n\nA deploy goes out to a new environment with `DATABASE_URL` missing. The process boots. `/health` returns 200. The container is marked healthy and the deploy is green. Twenty minutes later, after you closed your laptop, the first request that touches the database 500s, and it keeps 500ing until someone wakes up.\n\nAnd when you finally get on the machine to investigate, the logs are four thousand lines of `console.log(\"here\", data)` with no timestamps, no request ids, no severity, interleaved from three processes, and no way to search for the one request the user complained about.\n\n## The idea\n\nOne habit, three applications: **validate at the boundary, then trust your own code.**\n\nEverything from outside the process is `unknown` until proven otherwise — request bodies, query strings, headers, environment variables, webhook payloads, third-party responses. Draw a wall at the edge, check things once as they cross, and inside the wall your types are actually true.\n\nThe analogy is the door of a venue. ID is checked once, at the entrance, by someone whose whole job is checking. No bartender inside re-checks. If you let unverified people in, every bartender has to be suspicious of everyone forever, and their suspicion will never be as thorough as the door.\n\nSkip the wall and you get defensive code everywhere: `if (!title) return`, `title?.trim() ?? \"\"`, `Number(limit) || 20`. Each one is an apology for not having checked, and collectively they still miss the case that pages you.\n\n## In practice\n\n**Zod for request bodies.** One schema, and the type comes free:\n\n```ts\nimport { z } from \"zod\";\n\nexport const createNoteSchema = z.object({\n  title: z.string().min(1).max(200),\n  body: z.string().max(10_000).default(\"\"),\n  tags: z.array(z.string().min(1)).max(10).optional(),\n});\n\nexport type CreateNoteInput = z.infer<\n  typeof createNoteSchema\n>;\n```\n\n`z.infer` is the point of the whole exercise. The runtime check and the compile-time type are the same declaration, so they cannot drift apart. Two parallel definitions always drift; one definition cannot.\n\nA middleware that applies any schema:\n\n```ts\nimport type { RequestHandler } from \"express\";\nimport type { ZodType, ZodTypeDef } from \"zod\";\n\nexport const validateBody =\n  <TBody,>(schema: ZodType<TBody, ZodTypeDef, unknown>): RequestHandler =>\n  (req, res, next) => {\n    const parsed = schema.safeParse(req.body);\n    if (!parsed.success) {\n      return res.status(400).json({\n        error: \"validation_failed\",\n        issues: parsed.error.issues.map((issue) => ({\n          path: issue.path.join(\".\"),\n          message: issue.message,\n        })),\n      });\n    }\n    req.body = parsed.data; // typed, coerced, defaults applied\n    next();\n  };\n```\n\nThree decisions in there worth defending. **`safeParse`, not `parse`** — a bad body is a 400, and `parse` throws, which without special handling becomes a 500 and blames you for the caller's mistake. **Return the issues** — future-you, debugging the app against this API, needs to know *which* field. **Map the issues yourself** rather than dumping `parsed.error` — the raw error is a library's internal shape, and shipping it makes your public contract depend on your zod version.\n\nQuery strings need coercion, because everything arriving in a URL is a string:\n\n```ts\nexport const listNotesQuery = z.object({\n  limit: z.coerce.number().int().min(1).max(100).default(20),\n  cursor: z.string().optional(),\n  includeDone: z.coerce.boolean().default(false),\n});\n```\n\nThat is the real fix for yesterday's `Number(req.query.limit)` returning `NaN`. The `.max(100)` also quietly closes a denial-of-service door: without it, someone requests a million rows.\n\n**Environment validation at startup.** This file runs before anything else:\n\n```ts\nimport { z } from \"zod\";\n\nconst envSchema = z.object({\n  NODE_ENV: z.enum([\"development\", \"test\", \"production\"]).default(\"development\"),\n  PORT: z.coerce.number().int().default(3000),\n  DATABASE_URL: z.string().url(),\n  JWT_SECRET: z.string().min(32),\n  LOG_LEVEL: z.enum([\"debug\", \"info\", \"warn\", \"error\"]).default(\"info\"),\n});\n\nconst parsed = envSchema.safeParse(process.env);\nif (!parsed.success) {\n  process.stderr.write(\n    `invalid environment:\\n${JSON.stringify(parsed.error.flatten().fieldErrors, null, 2)}\\n`,\n  );\n  process.exit(1);\n}\n\nexport const env = parsed.data;\n```\n\nImport `env` everywhere. Never touch `process.env` again outside this file. Two payoffs: `process.env.PORT` is `string | undefined` at every use site, while `env.PORT` is a `number`, once. And crashing on boot is a *feature*. A deploy that dies immediately and loudly gets rolled back in two minutes by a pipeline. A deploy that dies on request four hundred pages a human.\n\n**Structured logging with pino.**\n\n```ts\nimport pino from \"pino\";\nimport { env } from \"./env\";\n\nexport const logger = pino({\n  level: env.LOG_LEVEL,\n  redact: [\"req.headers.authorization\", \"*.password\", \"*.token\"],\n  ...(env.NODE_ENV === \"development\" ? { transport: { target: \"pino-pretty\" } } : {}),\n});\n\nlogger.info({ userId, noteId }, \"note_created\");\n```\n\nObject first, message second. Levels mean something: `debug` is local noise, `info` is a business event worth counting, `warn` is something recovered from, `error` needs a human. Setting `LOG_LEVEL=info` in production then silences debug without touching code.\n\nWhy not `console.log`? Three reasons, in order of how much they will cost you. It has no levels, so you cannot turn it down. It emits prose, and prose cannot be filtered, aggregated, or alerted on — `{\"level\":50,\"msg\":\"note_create_failed\",\"noteId\":\"a1\"}` is a query, `here undefined` is not. And when stdout is a pipe or a file, as it is in every container, `console.log` writes **synchronously** and blocks the event loop, so under load your logging becomes your bottleneck.\n\nLast piece, and the one that makes logs usable: give every request an id.\n\n```ts\nimport { randomUUID } from \"node:crypto\";\n\napp.use((req, res, next) => {\n  const requestId = req.header(\"x-request-id\") ?? randomUUID();\n  req.log = logger.child({ requestId });\n  res.setHeader(\"x-request-id\", requestId);\n  next();\n});\n```\n\nUse `req.log` inside handlers instead of the root logger and every line from one request shares an id, across every service it touches. Echo that header into your app's error toast and a user's screenshot becomes a database query.\n\n## In your world\n\nAll five practice projects begin with the same three files: `env.ts`, `logger.ts`, `validate.ts`. Write them once today, well, and you are copying a known-good foundation four more times instead of relearning it.\n\nYour work backend does the same three things in its own idiom. Route schemas validate the request *and* generate the API description your mobile app is built against, so a schema there is simultaneously the check and the documentation — one more reason the schema is the single source of truth rather than a duplicate of the type. Env validation matters even more on that team than on your practice projects, because merging to main *is* the production deploy: a missing variable caught at boot fails the deploy, and the same variable caught at request time is an incident with users in it.\n\n## Watch out\n\n- `schema.parse()` inside a route throws, and an unhandled ZodError becomes a 500 for what is really a 400. Either use `safeParse` at the boundary or teach your error handler about ZodError. Pick one; do not do both halfway.\n- Validating the body and ignoring params, query, and headers. All four are equally attacker-controlled.\n- `.optional()`, `.nullable()`, and `.default()` are three different contracts. Your app will feel the difference between a missing key, a null, and a zero.\n- Logging whole request bodies from auth routes puts passwords and tokens in your log store forever, including in whatever third-party service ships them. Redact by key, at the logger, not at each call site.",
+      "tasks": [
+        "Write env.ts with a Zod schema, then boot the app with DATABASE_URL removed and confirm the process refuses to start and exits non-zero.",
+        "Write logger.ts with pino: level from LOG_LEVEL, pretty transport in development only, redaction for the authorization header and any password or token field.",
+        "Write the validateBody middleware with safeParse and wire it to a POST route whose schema requires a non-empty title.",
+        "Send three bad bodies (missing field, wrong type, empty string) and record the exact 400 payload each one produces.",
+        "Add a query schema using z.coerce.number for limit, then request limit=abc and limit=9999 and record both responses.",
+        "Add the request-id middleware and prove that two log lines from the same request share one id, and that the id comes back in a response header.",
+        "Replace every console.log in the project with a logger call, then set LOG_LEVEL=warn and confirm the info lines disappear without a code change."
+      ],
+      "quiz": [
+        {
+          "q": "A route calls schema.parse(req.body) and the body is invalid. What does the client get, with no other changes?",
+          "options": [
+            "A 400 with the validation issues",
+            "A 500, because parse throws and an unhandled ZodError is just another exception",
+            "A 422 automatically",
+            "An empty 200"
+          ],
+          "answer": 1,
+          "explain": "parse throws. Unless your error handler knows about ZodError, the caller's mistake is reported as your server breaking. safeParse at the boundary returns a result you turn into an honest 400."
+        },
+        {
+          "q": "Why validate environment variables at startup instead of at the point of use?",
+          "options": [
+            "It is faster at runtime",
+            "A misconfigured process then fails immediately and loudly, so a pipeline rolls it back, instead of failing on some request hours later",
+            "Because process.env is read-only",
+            "So you can commit the values to git safely"
+          ],
+          "answer": 1,
+          "explain": "Crash-on-boot is a feature. The alternative is a green deploy that starts 500ing on the first request that happens to touch the missing config, usually after you have logged off."
+        },
+        {
+          "q": "What is the strongest technical argument against console.log in a server?",
+          "options": [
+            "It is slower to type than logger.info",
+            "It has no levels, emits unsearchable prose, and writes synchronously to a pipe or file, which blocks the event loop under load",
+            "It cannot print objects",
+            "It is removed in production builds"
+          ],
+          "answer": 1,
+          "explain": "All three matter, and the blocking write is the one that surprises people: in a container, stdout is a pipe, and heavy logging becomes your throughput ceiling."
+        },
+        {
+          "q": "What does z.infer give you that writing the interface by hand does not?",
+          "options": [
+            "Faster parsing",
+            "One declaration that is both the runtime check and the compile-time type, so the two cannot drift apart",
+            "Automatic 400 responses",
+            "Database migrations"
+          ],
+          "answer": 1,
+          "explain": "Two parallel definitions always diverge eventually, and the divergence is invisible until production. Deriving the type from the schema makes that impossible."
+        },
+        {
+          "q": "Why use z.coerce.number() for a query param instead of z.number()?",
+          "options": [
+            "z.number() is deprecated",
+            "Query values always arrive as strings, so a plain number schema would reject every request",
+            "coerce also validates the range",
+            "It makes the field optional"
+          ],
+          "answer": 1,
+          "explain": "The URL carries text. Coercion converts at the boundary so everything downstream sees a real number, which is the proper fix for hand-written Number() casts."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Zod — official docs",
+          "url": "https://zod.dev"
+        },
+        {
+          "label": "Pino — official docs",
+          "url": "https://getpino.io"
+        },
+        {
+          "label": "Node.js — process.env and process.exit",
+          "url": "https://nodejs.org/api/process.html"
+        },
+        {
+          "label": "roadmap.sh — Backend developer roadmap",
+          "url": "https://roadmap.sh/backend"
+        }
+      ]
+    },
+    "m0-7": {
+      "content": "## The problem\n\nAn endpoint starts as eight lines. Six months later it is two hundred: reading the body, checking permissions, filtering a list, formatting dates, calling a third party, and answering, all inside one route callback. Then a second endpoint needs the same rule — \"only notes that are not deleted\" — and someone copies the filter across. Then a third. Then search ships, and the bug report arrives: search returns deleted notes.\n\nThree places knew the rule. One of them forgot. And nobody can write a test for the rule, because the rule does not exist as a thing you can call. It exists as three identical lines in three files, which is the same as not existing.\n\nSecond story, same day. A user deletes a note, then asks a week later what it said because it matters to a dispute. The row is gone. Worse: the comments table still holds two rows pointing at that note id, and the screen that joins them renders a blank card nobody can explain. Deletion took ten milliseconds and destroyed information you did not know you were storing.\n\n## The idea\n\nThree jobs, so three layers.\n\n- **Route** — the HTTP job. Read the request, validate it, call one service function, translate the result into a status code. Knows about `req` and `res`. Knows nothing about how notes are stored.\n- **Service** — the rules job. What a note is, who may touch it, what \"deleted\" means. Knows nothing about HTTP: no `req`, no `res`, no status codes.\n- **Data** — the storage job. Today an array inside a module. On day 11, a Postgres table. The service should not notice the difference.\n\nYou already do this in your app. A screen component renders props. A hook or store holds the rules. An API client does the fetching. You would not put a business rule and a network call inside a button's `onPress`. **The route is the `onPress`.**\n\nHere is the test for whether you got it right: *could you call your service from a CLI script or a background worker, with no HTTP anywhere in the process?* If yes, the layers are clean. If the answer involves faking a request object, they are not.\n\n**Soft delete** is the second idea. Deleting means writing `deletedAt = now`, not removing the row. That one column buys three things: an audit trail (who deleted what, when, and what it said), an undo that is a one-line update, and referential integrity — comments, attachments, and analytics rows pointing at that id keep resolving. The cost is that every read must remember to filter, which is precisely why the filter lives in exactly one place.\n\n## In practice\n\n**The store** owns the data and nothing else touches it.\n\n```ts\n// src/notes/notes.store.ts\nexport interface Note {\n  id: string;\n  title: string;\n  body: string;\n  createdAt: string;\n  deletedAt: string | null;\n}\n\n// deliberately not exported: the array is an implementation detail\nlet notes: readonly Note[] = [];\n\nexport function insert(note: Note): Note {\n  notes = [...notes, note];\n  return note;\n}\n\nexport function findAll(includeDeleted = false): readonly Note[] {\n  return includeDeleted ? notes : notes.filter((note) => note.deletedAt === null);\n}\n\nexport function findById(id: string): Note | undefined {\n  return notes.find((note) => note.id === id);\n}\n\nexport function setDeletedAt(id: string, at: string): Note | undefined {\n  const found = notes.find((note) => note.id === id);\n  if (!found) return undefined;\n  const updated: Note = { ...found, deletedAt: at };\n  notes = notes.map((note) => (note.id === id ? updated : note));\n  return updated;\n}\n```\n\nThe `let` is intentional and so is the `readonly`: the *reference* changes, the arrays never mutate. `notes` is not exported, so no other file can reach past these functions — which is the entire reason swapping in Postgres on day 11 will be a one-file change.\n\n**The service** holds the rules, and returns outcomes instead of throwing them.\n\n```ts\n// src/notes/notes.service.ts\nimport { randomUUID } from \"node:crypto\";\nimport * as store from \"./notes.store\";\nimport type { Note } from \"./notes.store\";\nimport type { CreateNoteInput } from \"./notes.schema\";\n\nexport type NoteResult =\n  | { ok: true; data: Note }\n  | { ok: false; reason: \"not_found\" };\n\nexport function createNote(input: CreateNoteInput): Note {\n  return store.insert({\n    id: randomUUID(),\n    title: input.title,\n    body: input.body,\n    createdAt: new Date().toISOString(),\n    deletedAt: null,\n  });\n}\n\nexport function listNotes(): readonly Note[] {\n  return store.findAll(); // deleted notes are excluded here, once, for everyone\n}\n\nexport function getNote(id: string): NoteResult {\n  const note = store.findById(id);\n  if (!note || note.deletedAt !== null) return { ok: false, reason: \"not_found\" };\n  return { ok: true, data: note };\n}\n\nexport function deleteNote(id: string): NoteResult {\n  const existing = getNote(id);\n  if (!existing.ok) return existing; // already deleted, or never existed\n  const updated = store.setDeletedAt(id, new Date().toISOString());\n  return updated ? { ok: true, data: updated } : { ok: false, reason: \"not_found\" };\n}\n```\n\nTwo things to notice. A soft-deleted note is **not found** — the row exists, the *resource* does not — and that judgement lives here, not in a route. And \"missing\" is a return value, not an exception. A 404 is an ordinary outcome of a GET, not an emergency; exceptions are for things you did not plan for. The `ok` discriminant is what lets the caller narrow the type safely, which is the pattern side quest 1 generalises.\n\n**The route** is thin enough to read in one glance.\n\n```ts\n// src/notes/notes.routes.ts\nimport { Router } from \"express\";\nimport { validateBody } from \"../middleware/validate\";\nimport { createNoteSchema } from \"./notes.schema\";\nimport * as service from \"./notes.service\";\n\nexport const notesRouter = Router();\n\nnotesRouter.post(\"/\", validateBody(createNoteSchema), (req, res) => {\n  const note = service.createNote(req.body);\n  res.status(201).location(`/notes/${note.id}`).json(note);\n});\n\nnotesRouter.get(\"/\", (_req, res) => {\n  res.json({ data: service.listNotes() });\n});\n\nnotesRouter.get(\"/:id\", (req, res) => {\n  const result = service.getNote(req.params.id);\n  if (!result.ok) return res.status(404).json({ error: \"note_not_found\" });\n  res.json(result.data);\n});\n\nnotesRouter.delete(\"/:id\", (req, res) => {\n  const result = service.deleteNote(req.params.id);\n  if (!result.ok) return res.status(404).json({ error: \"note_not_found\" });\n  res.status(204).send();\n});\n```\n\nGrep this file for `deletedAt`. It is not there, and that absence is the deliverable. The route knows there is such a thing as \"not found\"; it does not know *why* something might be missing. When you add \"notes hidden by moderation\" in three months, you change the service and every route keeps working.\n\nThe delete returns 204 with no body, because there is nothing to say. Returning 200 with the deleted note is also defensible. Doing one on some endpoints and the other elsewhere is not.\n\n## In your world\n\nThis skeleton is the next four weeks. Every one of your five practice projects is `routes/`, `services/`, schemas, and a data layer that migrates from an array to supabase-js to hand-written SQL without the services caring. When you get to task-manager-api on day 11, you are filling in this shape, not learning a new one.\n\nYour work backend enforces exactly this and will reject a PR that does not: routes validate and delegate, services are plain exported functions that take the database handle as their first argument, and no business logic lives in a route. Soft delete is there too — content tables carry a deleted marker rather than losing rows, because a hard delete would orphan comments, reactions, and notification rows, and would destroy the record needed to answer a moderation question a week later. When you read that code in phase 6 and see `deletedAt` filters inside services rather than routes, you will already know what it is protecting.\n\n## Watch out\n\n- A route that touches the store directly is the first line of the two-hundred-line handler, and the first copy of a filter that will end up scattered across four endpoints.\n- A service that accepts `req` or returns a status code is a route with a misleading filename. HTTP stops at the boundary.\n- Returning the whole stored object straight from a route leaks internal fields — `deletedAt` today, a password hash later. A response shape is a decision, not a side effect of your storage. And `any` anywhere in this chain silences exactly the mismatch layering exists to catch.\n- Soft delete is not free. Every future query carries the filter, unique constraints need care (a deleted user's email still occupies it), and rows accumulate. Those are the tradeoffs you accept in exchange for being able to answer questions about the past.\n\n## Checkpoint\n\nAnswer these out loud, from memory, with the editor closed. If you narrate and it comes out vague, that vagueness is the gap.\n\n1. Walk the path of `POST /notes` from the moment the bytes arrive to the moment the response leaves, naming every file it touches and what each one is responsible for.\n2. Why does `GET /notes/:id` call a service instead of filtering the array inline in the route? Name two concrete things that break within a week of skipping the service.\n3. A client sends `{ \"title\": \"\" }` and gets a 400 with a Zod issue saying the title is too short. Name one good fix and one bad fix, and explain what makes the bad one bad.\n4. Why does DELETE set a flag instead of removing the row? Give one specific question you can answer after a soft delete that you cannot answer after a hard delete.\n5. A teammate writes `const input = req.body as any` to silence a type error and the build goes green. What did you lose, and where will it fail instead?\n6. Next week the array becomes a Postgres table. Which files change, which must not, and is there anything in your current code that breaks that promise?",
+      "tasks": [
+        "Build notes.store.ts, notes.schema.ts, notes.service.ts and notes.routes.ts, each with only the responsibility described in the lesson.",
+        "Implement POST /notes (201 plus Location), GET /notes, GET /notes/:id and DELETE /notes/:id (204), with Zod validation on the create body.",
+        "Make DELETE set deletedAt, then confirm GET /notes excludes the note and GET /notes/:id returns 404 rather than a note with a deletedAt field.",
+        "Grep notes.routes.ts for deletedAt and confirm zero hits. If there are any, move the rule down into the service.",
+        "Run the hard-delete trap end to end, then remove the hard-delete code from the project.",
+        "Swap the store's array for a Map without editing notes.service.ts or notes.routes.ts. If you had to edit them, fix the boundary that leaked.",
+        "Answer all six checkpoint questions out loud with the editor closed. Record yourself and note every answer that came out vague."
+      ],
+      "quiz": [
+        {
+          "q": "Which of these belongs in the service, not the route?",
+          "options": [
+            "Choosing between 404 and 200",
+            "Deciding that a note with a deletedAt timestamp counts as not found",
+            "Reading the id out of req.params",
+            "Setting the Location response header"
+          ],
+          "answer": 1,
+          "explain": "That is a rule about what a note is, so it belongs where the rules live. The route's job is only to translate the service's outcome into HTTP."
+        },
+        {
+          "q": "Why does the service return `{ ok: false, reason: 'not_found' }` instead of throwing a NotFoundError?",
+          "options": [
+            "Throwing is slower",
+            "A missing row is an ordinary, expected outcome of a lookup; exceptions are for things you did not plan for, and a returned union forces every caller to handle the case",
+            "Express cannot catch exceptions",
+            "So the route can ignore the failure case"
+          ],
+          "answer": 1,
+          "explain": "The discriminated union makes the failure part of the type, so a caller that forgets to handle it does not compile. A thrown error is invisible to the type system."
+        },
+        {
+          "q": "What does soft delete buy you that a hard delete cannot?",
+          "options": [
+            "Faster reads",
+            "An audit trail, a one-line undo, and rows elsewhere that reference the id still resolving to real content",
+            "Smaller database size",
+            "Automatic cascading to child rows"
+          ],
+          "answer": 1,
+          "explain": "The row keeps existing, so you can still answer who deleted it, when, and what it said, and comments or attachments pointing at it do not become dangling references."
+        },
+        {
+          "q": "Why is the notes array not exported from the store module?",
+          "options": [
+            "Exports are slow",
+            "Because if any other file can reach the array, the store's functions stop being the only way in and swapping in a database stops being a one-file change",
+            "TypeScript forbids exporting arrays",
+            "So the array can be mutated safely"
+          ],
+          "answer": 1,
+          "explain": "Encapsulation is what makes the data layer replaceable. Every direct reader of the raw array is another file you must edit on migration day."
+        },
+        {
+          "q": "Which layer is allowed to know about status codes?",
+          "options": [
+            "All three, so each can fail properly",
+            "Only the route: the service returns outcomes, and the store returns data or undefined",
+            "Only the service, since it knows what went wrong",
+            "Only the error handler"
+          ],
+          "answer": 1,
+          "explain": "HTTP stops at the route. A service that returns 404 cannot be called from a worker or a CLI script without dragging HTTP semantics into places that have no requests."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Express — Routing guide",
+          "url": "https://expressjs.com/en/guide/routing.html"
+        },
+        {
+          "label": "PostgreSQL — Constraints and foreign keys",
+          "url": "https://www.postgresql.org/docs/current/ddl-constraints.html"
+        },
+        {
+          "label": "roadmap.sh — Backend developer roadmap",
+          "url": "https://roadmap.sh/backend"
+        },
+        {
+          "label": "roadmap.sh — API design",
+          "url": "https://roadmap.sh/api-design"
+        }
+      ],
+      "trap": {
+        "title": "Hard delete, and the comment that points at nothing",
+        "content": "Build the wrong version first. You need to feel this once so that \"just delete the row\" stops sounding simpler.\n\n**Set it up.** Add a second store with comments that reference notes:\n\n```ts\n// src/comments/comments.store.ts\nexport interface Comment {\n  id: string;\n  noteId: string;\n  text: string;\n}\n\nlet comments: readonly Comment[] = [];\n\nexport function insert(comment: Comment): Comment {\n  comments = [...comments, comment];\n  return comment;\n}\n\nexport function findByNoteId(noteId: string): readonly Comment[] {\n  return comments.filter((comment) => comment.noteId === noteId);\n}\n```\n\nAdd a hard-delete endpoint that really removes the note, plus `GET /notes/:id/comments`.\n\n```ts\n// in notes.store.ts — the version you will delete afterwards\nexport function hardDelete(id: string): void {\n  notes = notes.filter((note) => note.id !== id);\n}\n```\n\n**Run the sequence.**\n\n1. `POST /notes` with title \"Q3 pricing agreed with vendor\".\n2. Add two comments on it.\n3. `DELETE /notes/:id` using the hard-delete route.\n4. `GET /notes/:id` — 404, as expected. Fine so far.\n5. `GET /notes/:id/comments` — two comments come back, pointing at a note that does not exist. Your app would render two comment bubbles under a missing parent. Nothing errored. Nothing logged.\n6. Now try to answer the question a real user will ask you: *\"What did that note say?\"* You cannot. Not from the API, not from the logs, not from anywhere. The sentence is gone.\n7. And the follow-up your manager will ask: *\"Who deleted it, and when?\"* Also gone.\n\n**Then flip it.** Delete `hardDelete`, use the soft-delete service from the lesson, and repeat the sequence. `GET /notes/:id` still returns 404 — the resource is still gone from the caller's point of view. But the row is right there with a `deletedAt` timestamp, so both questions have answers, the comments still resolve to real content, and restoring is one update.\n\n**Write down the two lessons.** First: hard delete destroys the answer to questions you have not been asked yet. Second: a real database would have had an opinion here — a foreign key would either have *refused* the delete or cascaded and destroyed the comments too, and both of those are worse surprises when you discover them in production. You will meet foreign keys and `ON DELETE` behaviour on day 7. Arrive already knowing why they matter."
+      }
+    },
+    "sq-1": {
+      "content": "## The problem\n\nIn your app, a wrong type shows up in half a second. The label renders `undefined`, the list is empty, a red box appears. The compiler catches some of it and a visible UI catches the rest, so loose typing is survivable.\n\nA service has neither. It returns `{ user: undefined }`, the route serialises it, the key silently vanishes from the JSON, and nobody notices until a client crashes on a missing field — or a nightly job writes nulls for a week. On the backend the type system is most of the feedback loop you get before production.\n\n## The idea\n\nYou do not need more TypeScript. You need four specific things at the places where RN habits leak: unknown errors, result shapes, generic helpers, and literal types.\n\n## In practice\n\n`unknown` in catch, which you will write daily:\n\n```ts\ntry {\n  await chargeCard(orderId);\n} catch (err: unknown) {\n  if (err instanceof PaymentDeclined) return { ok: false, reason: \"declined\" } as const;\n  if (err instanceof Error) logger.error({ msg: err.message }, \"charge_failed\");\n  throw err; // never swallow what you did not recognise\n}\n```\n\nWith `catch (err: any)` you get to write `err.response.data.message`, which throws a TypeError *inside your error handler* — a crash while handling a crash, at the worst possible moment.\n\nDiscriminated unions for results, which is yesterday's `NoteResult` made reusable:\n\n```ts\nexport type Result<TData, TReason extends string> =\n  | { ok: true; data: TData }\n  | { ok: false; reason: TReason };\n\nfunction toStatus(result: Result<Note, \"not_found\" | \"forbidden\">): number {\n  if (result.ok) return 200;\n  return result.reason === \"forbidden\" ? 403 : 404; // reason is narrowed to two literals\n}\n```\n\nAdd a third reason and every caller that does not handle it stops compiling. That is the failure signal a screen would have given you for free.\n\nGenerics on helpers, so type information survives the boundary:\n\n```ts\nexport function groupBy<TItem, TKey extends string>(\n  items: readonly TItem[],\n  keyOf: (item: TItem) => TKey,\n): Record<TKey, readonly TItem[]> {\n  // ...\n}\n```\n\nWithout the type parameters this returns `any` and every caller inherits the blindness — the same reason day 5's `validateBody` is generic.\n\n`as const` for lists that are also types:\n\n```ts\nexport const ROLES = [\"user\", \"moderator\", \"admin\"] as const;\nexport type Role = (typeof ROLES)[number]; // \"user\" | \"moderator\" | \"admin\"\n```\n\nOne list, used by the runtime check and the type. Without `as const` it is `string[]` and `Role` collapses to `string`.\n\nAnd `interface` for object shapes: better errors, and it merges — which is exactly how you typed `req.user` on day 4. Keep `type` for unions, intersections, and mapped types.\n\n## In your world\n\nThe result union is your notes service. The generic validator is day 5. Role literals return in RBAC on day 25. `unknown` catches are every job handler you will write, where a swallowed error either retries forever or fails silently, and no screen will ever tell you.\n\n## Watch out\n\n- `value as SomeType` is not validation. It is a promise to the compiler that you might be breaking. Zod is validation.\n- A non-null `!` on a database lookup is the assertion most likely to page you.\n- `Partial` on an update input makes every field optional, including the ones your rules require.\n- `unknown` is only useful if you narrow it. `unknown` plus an immediate cast is `any` wearing a costume.",
+      "tasks": [
+        "Rewrite one catch block in a practice project from `any` to `unknown` with instanceof narrowing, and make sure unrecognised errors are re-thrown.",
+        "Move the Result union into a shared types file and use it in two different services.",
+        "Convert one role or status string array to `as const` and derive the union type from it, then use that type in a function signature.",
+        "Turn one duplicated helper into a generic function and confirm the call site keeps its concrete types instead of collapsing to any."
+      ],
+      "quiz": [
+        {
+          "q": "Why type a catch parameter as unknown rather than any?",
+          "options": [
+            "unknown is faster at runtime",
+            "any lets you access properties that may not exist, so you can throw a TypeError inside your own error handler",
+            "unknown automatically converts errors to strings",
+            "any is not allowed in catch clauses"
+          ],
+          "answer": 1,
+          "explain": "With any, err.response.data.message compiles and then explodes at the worst moment. unknown forces you to prove what you caught before you read it."
+        },
+        {
+          "q": "What does `as const` change about `const ROLES = ['user', 'admin']`?",
+          "options": [
+            "It freezes the array at runtime only",
+            "The type becomes a readonly tuple of literals, so you can derive a 'user' | 'admin' union from it instead of getting string[]",
+            "It makes the array mutable",
+            "Nothing, it is a style preference"
+          ],
+          "answer": 1,
+          "explain": "Without it the element type is string and any derived type collapses to string. With it, one list serves as both the runtime check and the type."
+        },
+        {
+          "q": "What does a discriminated union result type give you that a thrown error does not?",
+          "options": [
+            "Better stack traces",
+            "The compiler enforces that every caller handles every failure case, and adding a new case breaks the build instead of failing silently",
+            "Automatic HTTP status mapping",
+            "Faster execution"
+          ],
+          "answer": 1,
+          "explain": "Failure becomes part of the signature. On a server, where there is no screen to show you the mistake, the compiler is the feedback loop you have."
+        }
+      ],
+      "resources": [
+        {
+          "label": "TypeScript — Generics",
+          "url": "https://www.typescriptlang.org/docs/handbook/2/generics.html"
+        },
+        {
+          "label": "TypeScript — Narrowing",
+          "url": "https://www.typescriptlang.org/docs/handbook/2/narrowing.html"
+        },
+        {
+          "label": "roadmap.sh — TypeScript roadmap",
+          "url": "https://roadmap.sh/typescript"
+        },
+        {
+          "label": "Zod — official docs",
+          "url": "https://zod.dev"
+        }
+      ]
+    }
+  }
+}

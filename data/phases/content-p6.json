@@ -1,0 +1,707 @@
+{
+  "phaseId": "p6",
+  "modules": {
+    "m6-1": {
+      "content": "## The problem\n\nThe feature worked all week on your Mac. You push, the deploy runs, and the container never comes up: `Error: Could not load the \"sharp\" module using the darwin-arm64 runtime`. You fix that and redeploy. Now it boots and exits one second later, because the connection string you had been using lived in a `.env` that was never committed and never will be. Third attempt: the process stays up, but every request returns `ECONNREFUSED 127.0.0.1:5432`, because the Postgres you were talking to all week was the one on your laptop.\n\nNone of those three failures is a bug in your code. They are three faces of one fact: your code never runs alone. It runs on a specific runtime version, on native binaries compiled for a specific CPU, with specific environment variables, next to specific neighbours at specific addresses. On your machine all of that is invisible, accumulated over two years of installing things. On the server, none of it exists. You know this shape of pain already: the build that runs beautifully in the simulator and crashes on a real device running last year's OS. \"Works on my machine\" is not a joke, it is a missing spec.\n\n## The idea\n\nAn **image** is that missing spec, made executable: a frozen filesystem plus a default command, holding your compiled code, its dependencies, the runtime, and the system libraries, all pinned. Think of it exactly as the `.ipa` or `.aab` you upload to a store, an immutable versioned artifact that carries everything it needs, built once and installed many times.\n\nA **container** is that image running. Image is the class, container is the instance. Twenty containers from one image start life identical, which is the entire point: the thing you tested is byte-for-byte the thing that runs.\n\nThe build is made of **layers**. Each Dockerfile instruction produces one layer, and Docker caches it keyed on the instruction plus the files it read. If nothing feeding a layer changed, that layer and every layer before it are reused instantly. The moment one changes, everything after it rebuilds. That single rule is why the ordering below is not stylistic.\n\n## In practice\n\nCopy the lockfile and install *before* copying source. Source changes every commit; dependencies change monthly.\n\n```dockerfile\n# ---- build stage: needs devDependencies and the TS compiler\nFROM node:22-slim AS build\nWORKDIR /app\nCOPY package.json package-lock.json ./\nRUN npm ci\nCOPY . .\nRUN npm run build\n\n# ---- runtime stage: no compiler, no dev deps, no source\nFROM node:22-slim AS runtime\nENV NODE_ENV=production\nWORKDIR /app\nCOPY package.json package-lock.json ./\nRUN npm ci --omit=dev\nCOPY --from=build /app/dist ./dist\nUSER node\nEXPOSE 3000\nCMD [\"node\", \"dist/server.js\"]\n```\n\nThe compiler is a build-time tool, so the final image ships no TypeScript, no tests, no `devDependencies`: smaller to pull and smaller to attack. `USER node` drops root, so code execution inside the container lands as an unprivileged user. `EXPOSE` documents the port, it publishes nothing. `CMD` in array form runs your process as PID 1, which matters in a minute.\n\nA `.dockerignore` is not optional. Without it, `COPY . .` drags your macOS-compiled `node_modules`, your `.git` history, and your local `.env` into the image.\n\n```bash\nnode_modules\ndist\n.git\n.env\n.env.*\ncoverage\n```\n\nNow the neighbours. Compose describes the local world in one file, and service names are hostnames on a private network: the API reaches Postgres at `db`, not `localhost`.\n\n```yaml\nservices:\n  api:\n    build: .\n    ports: [\"3000:3000\"]\n    environment:\n      DATABASE_URL: postgres://app:devpassword@db:5432/app\n      REDIS_URL: redis://cache:6379\n    depends_on:\n      db:\n        condition: service_healthy\n  db:\n    image: postgres:16\n    environment:\n      POSTGRES_USER: app\n      POSTGRES_PASSWORD: devpassword\n      POSTGRES_DB: app\n    volumes: [\"pgdata:/var/lib/postgresql/data\"]\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U app\"]\n      interval: 5s\n  cache:\n    image: redis:7\nvolumes:\n  pgdata:\n```\n\n`devpassword` is a throwaway local value and belongs here; a real credential never does. The named volume `pgdata` is what makes data survive `docker compose down`, because container filesystems are disposable by design.\n\nDisposable is also why shutdown is now your problem. When the platform replaces your container it sends `SIGTERM` and starts a stopwatch, usually 10 to 30 seconds, then sends `SIGKILL`, which you cannot catch. Everything in flight at that instant dies mid-sentence unless you handle the first signal.\n\n```ts\nlet shuttingDown = false;\n\nasync function shutdown(signal: string) {\n  if (shuttingDown) return;\n  shuttingDown = true;\n  logger.info({ signal }, \"shutdown started\");\n  await new Promise((done) => server.close(done)); // stop accepting new work\n  await worker.close();                            // let in-flight jobs finish\n  await pool.end();                                // close DB sockets cleanly\n  process.exit(0);\n}\n\nprocess.on(\"SIGTERM\", () => void shutdown(\"SIGTERM\"));\nprocess.on(\"SIGINT\", () => void shutdown(\"SIGINT\"));\n```\n\nOrder matters: stop taking new requests, then drain, then release connections. Skip `pool.end()` and Postgres holds those sessions until they time out, which is how a deploy loop quietly eats a connection limit.\n\n## In your world\n\nYou have used Docker for months without noticing. `supabase start` boots a stack of containers, which is why your local database survives a reboot and why ports collide when two projects run at once. Railway does the same on the other side: it builds an image from your repo and runs it as a container, which is exactly why a dependency that only compiles on your Mac fails there, and why `SIGTERM` handling is real work for the API and both workers.\n\nDo this for real on `file-vault-api`. It has a native image dependency and two neighbours, so it exercises everything here: multi-stage build, `.dockerignore`, compose with a named volume, and a shutdown path that finishes the thumbnail job it is holding instead of dropping it. The graceful shutdown you wrote for `project-tracker-api` is the same code; what is new is knowing who sends the signal and how long you get.\n\n## Watch out\n\n- `COPY . .` before installing invalidates the install layer on every commit. Your build goes from 8 seconds to 3 minutes and you will blame the CI runner.\n- A container has its own network namespace, so `localhost` inside the API container is the API container. Use service names, and remember the reverse when your laptop reaches a container through a published port.\n- `CMD npm start` (shell form) runs your process as a child of `/bin/sh`, which does not forward `SIGTERM`. Your handler never fires and every deploy is a hard kill.\n- `docker compose down -v` deletes the named volume and your local database with it. Without `-v` it survives.",
+      "tasks": [
+        "Write a two-stage Dockerfile for file-vault-api: a build stage with devDependencies that compiles TypeScript, and a slim runtime stage that copies only dist plus production dependencies and runs as a non-root user.",
+        "Add a .dockerignore excluding node_modules, .git, dist, and every .env file, then run docker build and compare image size before and after with `docker images`.",
+        "Time two rebuilds after changing one line of source: once with `COPY . .` before the install step, once with the lockfile copied first. Write down both numbers.",
+        "Write a docker-compose.yml bringing up the API, Postgres 16, and Redis 7 with a named volume for Postgres and a healthcheck gate on the database, then boot the stack with one command.",
+        "Run `docker compose down` then `up` and confirm your data survived. Then run `docker compose down -v` and confirm it did not.",
+        "Add SIGTERM and SIGINT handlers that stop the HTTP server, close the worker, and end the DB pool, then run `docker stop` and read the logs to prove the sequence completed before exit."
+      ],
+      "quiz": [
+        {
+          "q": "Why does copying package.json and the lockfile before the rest of your source make rebuilds dramatically faster?",
+          "options": [
+            "Docker installs dependencies in parallel when they arrive in their own layer",
+            "The dependency install layer stays cached as long as those two files are unchanged, so a source-only edit reuses it",
+            "npm refuses to use a cache when other files are present in the working directory",
+            "It makes the final image smaller, and smaller images build faster"
+          ],
+          "answer": 1,
+          "explain": "Each instruction is a cached layer keyed on its inputs. Source changes every commit; the lockfile rarely does. Copy the volatile files last so the expensive layer above them survives."
+        },
+        {
+          "q": "What does `EXPOSE 3000` in a Dockerfile actually do?",
+          "options": [
+            "Publishes port 3000 on the host so you can reach the container",
+            "Opens port 3000 in the container's firewall",
+            "Documents the port for humans and tooling; publishing still needs -p or a ports mapping",
+            "Forces the application to listen on port 3000"
+          ],
+          "answer": 2,
+          "explain": "EXPOSE is metadata. Reaching the container from your laptop needs `-p 3000:3000` or a compose ports entry; nothing about EXPOSE opens anything."
+        },
+        {
+          "q": "Your container has a SIGTERM handler that drains in-flight work, but every deploy kills it hard and the handler's log lines never appear. Most likely cause?",
+          "options": [
+            "CMD is in shell form, so your process runs under /bin/sh, which does not forward SIGTERM to it",
+            "SIGTERM cannot be caught by Node processes",
+            "The orchestrator sends SIGKILL first and SIGTERM afterwards",
+            "The handler must be registered before any other import"
+          ],
+          "answer": 0,
+          "explain": "Shell-form CMD makes /bin/sh PID 1 and your app its child, so the signal stops at the shell. Array-form CMD runs your process as PID 1, which receives the signal directly."
+        },
+        {
+          "q": "Inside the API container of a compose stack, what host should DATABASE_URL point at to reach the Postgres service named `db`?",
+          "options": [
+            "localhost, because compose shares one network namespace",
+            "127.0.0.1, with the published host port",
+            "db, the service name, which resolves on the compose network",
+            "host.docker.internal, always"
+          ],
+          "answer": 2,
+          "explain": "Each container has its own network namespace, so localhost inside the API container is the API container. Compose service names are DNS names on the shared network."
+        },
+        {
+          "q": "Why keep the TypeScript compiler and devDependencies out of the final runtime stage?",
+          "options": [
+            "Node refuses to run compiled output if the compiler is installed",
+            "A smaller image ships faster, starts faster, and has far less installed code to attack",
+            "devDependencies overwrite production dependencies at runtime",
+            "Multi-stage builds are required for any image that uses a lockfile"
+          ],
+          "answer": 1,
+          "explain": "Build tools are build-time concerns. Leaving them out cuts image size, pull time, and attack surface, which is why multi-stage is the default shape for compiled languages."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Dockerfile reference",
+          "url": "https://docs.docker.com/reference/dockerfile/"
+        },
+        {
+          "label": "Docker build cache",
+          "url": "https://docs.docker.com/build/cache/"
+        },
+        {
+          "label": "Docker Compose documentation",
+          "url": "https://docs.docker.com/compose/"
+        },
+        {
+          "label": "Node.js process and signal handling",
+          "url": "https://nodejs.org/api/process.html"
+        },
+        {
+          "label": "roadmap.sh DevOps track",
+          "url": "https://roadmap.sh/devops"
+        }
+      ],
+      "trap": {
+        "title": "The container that ignores your shutdown code",
+        "content": "Write a `SIGTERM` handler that logs `shutdown started`, waits 3 seconds, then logs `shutdown complete` and exits. Set your Dockerfile's last line to the shell form `CMD npm start`. Build, run, then from another terminal run `docker stop` on the container and watch the logs.\n\nNothing appears. After ten seconds the container is gone, killed by `SIGKILL`, and any request or job it held died mid-flight. Your handler was never called: `/bin/sh` is PID 1, it received the signal, and it did not pass it on.\n\nNow change the line to the array form and repeat. Both log lines appear and the exit is clean. Same code, same image contents, one difference in how the process is started.\n\nThe lesson generalises past Docker: when something you wrote does not seem to run, ask whether it is being reached before you debug what it does. And remember that every deploy on every platform is a `docker stop` in disguise, so this bug is silently active on every restart until you fix it."
+      }
+    },
+    "m6-2": {
+      "content": "## The problem\n\nSomeone pushes a branch, gets an approval on vibes, and merges. The type error they introduced was in a file nobody opened during review, so the first person to find out is whoever pulls next and watches their editor light up red.\n\nThe worse version has a user attached. A pull request contains a migration adding a `NOT NULL` column plus the code that populates it. The code deploys first, the migration lands a minute later, and for that minute every insert on that table fails: the app shows \"Something went wrong\" on the create screen and Sentry fills with constraint violations. Flip the order carelessly and you get the mirror image, where the migration drops a column the running code still selects and the feed 500s for everyone until the rollout finishes. Nobody wrote a bug. The *sequence* was the bug.\n\n## The idea\n\nYou already own a release pipeline: archive, sign, upload, TestFlight, review, phased release, watch the crash-free rate, halt if it dips. CI/CD is that pipeline with two substitutions. The machine that builds is a fresh cloud VM instead of your laptop, and the release is a merge instead of an upload.\n\n**CI** is a robot that clones your branch onto a machine with nothing on it, installs from the lockfile, and runs what a careful teammate would run: lint, type-check, tests. Its real value is not finding bugs. It is that a clean machine cannot be fooled by something you installed in 2023 and forgot.\n\n**CD** takes a commit that passed and makes it live somewhere, in a defined order, with the database moved first. **Branch protection** is what turns all of it from a norm into a mechanism: \"don't break main\" depends on everyone remembering, while \"merge is disabled until checks pass\" depends on nobody.\n\n## In practice\n\nStart with CI on pull requests. `on` is the trigger, a job is a machine, steps run in order on it, and `services` are sidecar containers, which is how you get a real Postgres instead of mocks.\n\n```yaml\nname: ci\non:\n  pull_request:\n    branches: [dev, main]\n\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    services:\n      postgres:\n        image: postgres:16\n        env:\n          POSTGRES_PASSWORD: postgres\n        ports: [\"5432:5432\"]\n        options: --health-cmd pg_isready --health-interval 5s --health-retries 10\n    steps:\n      - uses: actions/checkout@v4\n      - uses: oven-sh/setup-bun@v2\n      - run: bun install --frozen-lockfile\n      - run: bun run lint\n      - run: bun run type-check\n      - run: bun test\n        env:\n          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres\n```\n\n`--frozen-lockfile` is the philosophy in one flag: fail if the lockfile and manifest disagree rather than silently resolving a different dependency tree than the one you tested. Cache the install so the job stays under about five minutes, because a ten-minute pipeline gets routed around and a two-minute one gets trusted.\n\nThen wire it to the branch. In repository settings, require the `verify` check on `dev` and `main`, require a review, disallow direct pushes. From that moment \"main is always deployable\" is a property of the repo, not a promise.\n\nDeployment is the same file with a different trigger, and the ordering earns its keep.\n\n```yaml\nname: deploy\non:\n  push:\n    branches: [main]\n\njobs:\n  release:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - uses: actions/checkout@v4\n      - name: apply pending migrations\n        run: bunx supabase db push\n        env:\n          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}\n      # the platform watches the branch and rolls out the new image after this\n```\n\nMigrations run before the new code goes live, so for a few seconds the **old** code runs against the **new** schema. That is not a flaw to route around, it is the constraint that defines a safe schema change, and it gives you the one rule to memorise: **expand, migrate, contract.**\n\n```sql\n-- release 1, expand: purely additive. Old code ignores the new column.\nalter table profiles add column display_name text;\nupdate profiles set display_name = username where display_name is null;\n```\n\nRelease 1 also ships code that writes both columns and reads whichever exists:\n\n```ts\nconst name = row.displayName ?? row.username;\n```\n\nOnly once every instance runs that code, and nothing still reads the old column, does release 2 clean up:\n\n```sql\n-- release 2, contract: safe now, because nothing references it\nalter table profiles drop column username;\n```\n\nTwo releases to rename a column feels slow until you price the alternative: one `rename column`, an instant 500 on every read path, and a rollback that cannot help because the old code needs a column that no longer exists.\n\nSecrets live in the repository or environment secret store, referenced as `${{ secrets.NAME }}`, never in the workflow file, which is just code in your repo. Scope production secrets to a production environment with required reviewers, never `echo` one, and prefer short-lived credentials issued to the workflow over a permanent key pasted into settings.\n\n## In your world\n\nYour team's flow has the right shape and demands unusual discipline for one reason: **there is no deploy button.** A feature branch PRs into `dev`, and merging deploys the dev environment. Releases are cut from `dev` and opened as a PR into `main`, and merging *that* is the production deploy: CI applies pending migrations to the production database and the platform rolls out the new image. Nobody presses anything afterwards.\n\nSo treat a PR into `main` as \"Submit for Review\" and \"Release to 100%\" in one click. Before merging: read the full `dev` against `main` diff, not the last few commits. List every migration in the release and satisfy yourself each is expand-only or has a documented contract step later. Confirm the same commits have been running on the dev environment for more than a few minutes. Know which app versions are in the wild and whether any response shape changed under them, because users cannot upgrade as fast as you can merge. Then merge when you can watch it, announce it in your alerts channel, and stay for the error rate. That is your phased rollout, except the rollout is instant and the halt button is a revert commit.\n\n## Watch out\n\n- Green CI proves your tests passed, not that the change works. A repo with one meaningful test and a green badge is more dangerous than one with none, because the badge buys trust the tests have not earned.\n- Migrations run against the **old** code for a moment. Dropping, renaming, or tightening a constraint must be split across releases.\n- One flaky test kills the mechanism. People start merging past red, and once red means nothing, branch protection is theatre. Fix it or delete it the day you notice.\n- Pull requests from forks do not receive your secrets, by design. Anything needing a real credential belongs in a job that runs after merge.",
+      "tasks": [
+        "Write .github/workflows/ci.yml for one practice project: triggered on pull_request, installing with a frozen lockfile, running lint, type-check, and tests against a Postgres service container.",
+        "Open a PR that deliberately fails type-check and confirm the check goes red before anyone reviews it, then fix it and watch the same check go green.",
+        "Turn on branch protection for your main branch: require the CI check, require a review, disallow direct pushes. Then try to push directly and read the rejection.",
+        "Add dependency caching and record the before and after job duration. Target under five minutes total.",
+        "Write the expand/migrate/contract plan for renaming a column as two migration files plus the intermediate code that reads either shape. Do not write the one-shot rename.",
+        "Read your work repo's CI workflow files end to end and write down, in your own words, exactly what happens between merging a release PR and the new code serving traffic, including when migrations run.",
+        "Draft a release-PR checklist for a PR into main: full diff reviewed, migrations additive, already verified on dev, mobile client versions considered, rollback plan in one sentence."
+      ],
+      "quiz": [
+        {
+          "q": "Your pipeline applies pending migrations before the new build starts serving. Which code must be able to run against the new schema?",
+          "options": [
+            "The new code only, since it is what the migration was written for",
+            "The old code, because it is still serving requests while and just after the migration runs",
+            "Neither; traffic is paused during migrations",
+            "Both, but only if the migration takes longer than a second"
+          ],
+          "answer": 1,
+          "explain": "For the window between migration and rollout, the previous build is live against the new schema. That is the whole reason schema changes must be additive first."
+        },
+        {
+          "q": "What is the point of branch protection, given that the team already agreed not to break main?",
+          "options": [
+            "It speeds up CI by running checks earlier",
+            "It converts a social norm that depends on everyone remembering into a mechanism that does not",
+            "It prevents merge conflicts between branches",
+            "It signs commits so you can prove who broke the build"
+          ],
+          "answer": 1,
+          "explain": "Agreements fail quietly on a bad Friday. A required status check makes the merge button unavailable, which is a property of the repository rather than a promise from a human."
+        },
+        {
+          "q": "You need to rename `username` to `display_name` on a busy table with zero downtime. Correct sequence?",
+          "options": [
+            "One migration with `rename column`, deployed together with the code that uses the new name",
+            "Add the new column and backfill, ship code writing both and reading either, then drop the old column in a later release",
+            "Drop the old column first so nothing can read it, then add the new one and backfill",
+            "Rename it inside a transaction so readers block until the deploy finishes"
+          ],
+          "answer": 1,
+          "explain": "Expand, migrate, contract. Additive first keeps the old code working, keeps the rollback useful, and defers cleanup until nothing references the old shape."
+        },
+        {
+          "q": "Where does a production database URL belong in a GitHub Actions setup?",
+          "options": [
+            "In the workflow YAML, since only collaborators can read the repository",
+            "In a repository or environment secret, referenced as a secrets expression, and never echoed to logs",
+            "In a committed .env.production file that CI reads at run time",
+            "Passed as a workflow_dispatch input each time you deploy"
+          ],
+          "answer": 1,
+          "explain": "The workflow file is code in your repo, visible to everyone with read access and permanent in git history. Secrets belong in the secret store, scoped to an environment for production."
+        },
+        {
+          "q": "Your CI job needs a real credential, but the check must also run on pull requests from forks. What is true?",
+          "options": [
+            "Fork pull requests receive secrets as long as a maintainer approves the run",
+            "Fork pull requests do not receive your secrets by design, so credential-dependent work belongs in a post-merge job",
+            "Secrets work on forks if you store them at the organization level",
+            "Forks receive secrets but the values are masked in the logs"
+          ],
+          "answer": 1,
+          "explain": "If forks could read secrets, anyone could open a PR that printed them. Keep PR checks credential-free and put anything needing real credentials after merge."
+        }
+      ],
+      "resources": [
+        {
+          "label": "GitHub Actions documentation",
+          "url": "https://docs.github.com/en/actions"
+        },
+        {
+          "label": "GitHub repositories: branches and protection rules",
+          "url": "https://docs.github.com/en/repositories"
+        },
+        {
+          "label": "Supabase database migrations",
+          "url": "https://supabase.com/docs/guides/deployment/database-migrations"
+        },
+        {
+          "label": "PostgreSQL ALTER TABLE reference",
+          "url": "https://www.postgresql.org/docs/current/sql-altertable.html"
+        },
+        {
+          "label": "roadmap.sh DevOps track",
+          "url": "https://roadmap.sh/devops"
+        }
+      ],
+      "trap": {
+        "title": "The rename that took down the app",
+        "content": "Do this on a throwaway local database, never a shared one. Seed a table with a `username` column and run an API that selects it. Now, while the API is running and you are polling one endpoint in a loop, apply `alter table profiles rename column username to display_name;`.\n\nThe next request fails instantly: `column \"username\" does not exist`. Every request after it fails too. Your API did not change, was not redeployed, and has no bug in it. The schema moved out from under the running code.\n\nThen try to recover the way you would at 11pm. Reverting the code does nothing, because the old code needs a column that no longer exists. Reverting the migration means another rename, which is another window of failure, and if rows were written in the meantime you now have to reason about which name they used.\n\nRedo the same change as expand, migrate, contract and repeat the loop. Zero failed requests, because at no point does the live code depend on something the live schema lacks. That contrast is the whole argument, and it is why a one-shot rename in a release PR is a rollback you cannot perform."
+      }
+    },
+    "m6-4": {
+      "content": "## The problem\n\nA user DMs you at 4pm: \"the app is broken\". That is the entire report. You open the app on your phone and it works. You ask for a screenshot and get a spinner.\n\nCount what you don't know. Is it the API, the database, or their carrier? One endpoint or all of them? One user's data or one region's? Did it start now, or at the deploy this morning? That evening you find it: one endpoint has returned 500 for six hours to users whose profile has no avatar, because a `null` reached a code path that assumed a string. Around 400 people hit it. None of them told you except that one DM. They just stopped using the feature.\n\nThe bug took eleven minutes to fix. The six hours is the interesting number, and it is not a coding problem. On mobile you would never accept this: Crashlytics would have shown you a crash spike within minutes, grouped by build, with a stack trace. Your API has no such thing yet.\n\n## The idea\n\nObservability is the ability to answer questions about a running system without shipping code to answer them. Three kinds of signal get you there, and they are not interchangeable.\n\n**Logs** are the flight recorder transcript: discrete events with detail, telling you what happened to *one* request. **Metrics** are the cockpit gauges: numbers over time, cheap to store and graph, telling you whether the *system* is healthy compared with an hour ago. **Traces** are the itinerary of a single request across boundaries, API to database to job, with a timing per leg, telling you *where* the time went.\n\nThe mobile analogy is exact. A Crashlytics report is a log line with a stack trace, crash-free-users is a metric, and the breadcrumb trail before a crash is a poor man's trace. What backends add is that one request touches several processes, so correlation has to be deliberate: you thread a **request id** through every log line, which turns \"show me everything about that broken request\" from a guess into a filter.\n\n## In practice\n\nStructured means every line is JSON with consistent field names, so it is queryable. Levelled means you can turn detail up in one environment without drowning in it everywhere. Redaction keeps tokens and personal data out of a system many people can read.\n\n```ts\nexport const logger = pino({\n  level: process.env.LOG_LEVEL ?? \"info\",\n  redact: [\"req.headers.authorization\", \"req.headers.cookie\", \"*.password\", \"*.token\", \"*.email\"],\n});\n```\n\nThen correlate. Accept an inbound id if the caller sent one, generate it otherwise, echo it back so a bug report can carry it.\n\n```ts\napp.use((req, res, next) => {\n  const requestId = req.header(\"x-request-id\") ?? crypto.randomUUID();\n  res.setHeader(\"x-request-id\", requestId);\n  req.log = logger.child({ requestId, userId: req.user?.id, route: req.route?.path });\n  next();\n});\n```\n\nNow `req.log.warn({ postId }, \"avatar missing\")` inside a service carries the request, user, and route for free. Use levels with intent: `error` means a human should look, `warn` means suspicious but handled, `info` means a meaningful business event, `debug` is off in production.\n\nFor metrics, four numbers are worth alerting on, and only four to start.\n\n| Signal | The question | A sane first alert |\n|---|---|---|\n| Error rate | What fraction of requests fail? | 5xx above 1% for 5 minutes |\n| Latency | How slow at the tail? | p95 above 1s for 10 minutes |\n| Throughput | How much traffic? | Requests near zero (an outage looks like silence) |\n| Saturation | How close to a limit? | DB connections above 80% of the pool, queue depth climbing |\n\nPercentiles, not averages. Take 100 requests: 99 finish in 50ms, one takes 10 seconds. The average is 149ms, which looks excellent. The p99 is 10 seconds, which is one user in a hundred staring at a spinner until it times out, and on a feed screen calling five endpoints that means roughly one screen load in twenty is terrible. Averages hide exactly the customer you are about to lose, which is why you watch p50 for the typical experience, p95 for the annoyed, and p99 for the ones writing the DM.\n\nA trace makes the slow leg obvious. One request, several spans:\n\n```text\nPOST /posts                          412ms\n  auth.verifyToken                     8ms\n  db.insert posts                     11ms\n  db.select followers (no index)     389ms\n  jobs.enqueue feed.fanout             4ms\n```\n\nRead that and you know whether to fix a query, an index, or a network hop, instead of guessing from the total.\n\nThen the tools. Sentry handles exceptions, and two settings make it useful rather than noisy:\n\n```ts\nSentry.init({\n  dsn: process.env.SENTRY_DSN,\n  environment: process.env.APP_ENV,   // separates dev noise from production\n  release: process.env.GIT_SHA,       // \"which deploy introduced this\"\n  tracesSampleRate: 0.1,              // 100% of traces costs real money\n});\n```\n\n`release` is what turns \"there are errors\" into \"there are errors that started with the commit we shipped at 10:02\", the fastest diagnostic you own. Upload source maps in CI so traces point at your TypeScript, exactly as you do for a release build. PostHog answers the other half: not what crashed, but who uses this endpoint, how often, and whether usage fell off a cliff on Tuesday. A silent drop in a funnel is often the only symptom of a bug that returns 200 with wrong data.\n\nHealth checks are the cheapest observability you will add, and they must separate \"the process is alive\" from \"the process can serve\".\n\n```ts\napp.get(\"/health\", (_req, res) => res.json({ ok: true }));\n\napp.get(\"/ready\", async (_req, res) => {\n  try {\n    await pool.query(\"select 1\");\n    res.json({ ok: true });\n  } catch (err: unknown) {\n    logger.error({ err }, \"readiness failed\");\n    res.status(503).json({ ok: false });\n  }\n});\n```\n\nFinally, alert design, where most teams go wrong. An alert is a promise that a human will act. If nobody acts, it is not an alert, it is noise with a notification sound, and its real cost is teaching the team to ignore the channel. Alert on symptoms users feel (error rate, latency, queue backlog), not on causes you happen to measure (CPU at 70%). Give every alert an owner and one sentence about what to do first. Paged twice for the same non-actionable thing, delete the alert or fix the flap. Pager fatigue is not a personality flaw, it is a predictable outcome of bad alert design, and it ends with a real outage arriving in a channel everyone muted.\n\n## In your world\n\nYour work backend runs three processes: the API and two workers. So \"the backend is up\" is three questions, and a health check on the API returns 200 cheerfully while the feed worker has been dead an hour and no feed has been rebuilt. Observability has to be per-process: error rate and latency for the API, queue depth and failed-job count and time-since-last-completed-job for the workers. Write down which signal would catch a dead worker within five minutes, because the honest answer for most teams is \"a user tells us\".\n\nOn your practice projects, add the whole kit to `project-tracker-api`, which already has health checks and graceful shutdown. Then use `file-vault-api` for the trace: an upload that writes a row, pushes to storage, and enqueues a thumbnail job is a three-span story, and the first time you see the storage call eating 80% of the request you will stop guessing about performance.\n\n## Watch out\n\n- Never log a full request body on an auth route, and never log tokens, passwords, or emails anywhere. Logs get shipped to third parties, kept for months, and read by people who did not need to see that. Redact at the logger, not per call site, because the site you forget is the one with the password.\n- A health check that touches no dependency reports green through a total database outage. It is a liveness check, so never alert on it as if it proved the service can serve.\n- Log volume and trace sampling cost real money. `debug` left on in production, or one line per row in a loop, can outspend the server.\n- An error caught, logged at `info`, and returned as a 200 is invisible to Sentry and to your error rate. Silent failure is worse than a 500, which at least sets off an alarm.",
+      "tasks": [
+        "Add pino to project-tracker-api with redaction for authorization headers, cookies, passwords, and tokens, then confirm a request carrying a bearer token logs no token anywhere.",
+        "Add request-id middleware that accepts an inbound x-request-id or generates one, echoes it in the response, and attaches a child logger. Trace one request end to end using only the id.",
+        "Add /health (process alive) and /ready (queries the database), stop the Postgres container, and record what each one returns.",
+        "Wire Sentry into one project with environment and release set from the commit SHA, throw a deliberate error, and confirm the issue is tagged with that release.",
+        "Compute p50, p95, and p99 from a real request-duration log for one endpoint, then compute the average and write one sentence about what the average hid.",
+        "Design three alerts on paper: condition, threshold, window, who is notified, and the first action they take. Delete any that fail the 'someone will act on this' test.",
+        "Write down the one signal that would catch a dead background worker within five minutes, and how you would collect it."
+      ],
+      "quiz": [
+        {
+          "q": "99 requests take 50ms and one takes 10 seconds. Why is p99 the number that matters?",
+          "options": [
+            "The average of 149ms is wrong arithmetic; p99 corrects it",
+            "The average looks healthy while one user in a hundred is stuck watching a spinner, and a screen calling five endpoints hits that often",
+            "p99 is the only percentile that ignores outliers",
+            "Averages are fine for latency but wrong for error rates"
+          ],
+          "answer": 1,
+          "explain": "The average is arithmetically correct and operationally useless here. Tail latency is where real user pain lives, and it compounds across the several calls one screen makes."
+        },
+        {
+          "q": "What problem does threading a request id through every log line solve?",
+          "options": [
+            "It deduplicates identical log lines to reduce storage cost",
+            "It lets you retrieve every line from one request across middleware, services, and processes with a single filter",
+            "It replaces the need for structured logging",
+            "It identifies the user, so you no longer need a user id field"
+          ],
+          "answer": 1,
+          "explain": "Without correlation you are grepping timestamps and guessing which lines belong together. One id turns that into a filter, and it survives crossing process boundaries."
+        },
+        {
+          "q": "Your /health endpoint returns ok while the database has been unreachable for ten minutes. What went wrong?",
+          "options": [
+            "Nothing. It is a liveness check and correctly reports the process is running; readiness must touch dependencies",
+            "The endpoint is being cached by the load balancer",
+            "Health checks should always return 503 when in doubt",
+            "The database driver failed to propagate the error to the process"
+          ],
+          "answer": 0,
+          "explain": "Liveness and readiness answer different questions. A check that touches nothing can only tell you the event loop is turning, so never alert on it as if it proved the service can serve."
+        },
+        {
+          "q": "In Sentry, what does setting `release` to the deployed commit SHA buy you?",
+          "options": [
+            "Automatic source map resolution without uploading anything",
+            "The ability to say 'these errors started with the build we shipped at 10:02', usually the fastest diagnostic you have",
+            "Deduplication of identical stack traces",
+            "Sampling of errors so quota is not exhausted"
+          ],
+          "answer": 1,
+          "explain": "Release tagging turns 'there are errors' into 'these errors are new since that deploy', the backend equivalent of grouping crashes by app build."
+        },
+        {
+          "q": "Which alert is most likely worth waking someone for?",
+          "options": [
+            "CPU above 70% for five minutes",
+            "Memory above 60% of the container limit",
+            "5xx rate above 1% of requests for five minutes on a user-facing endpoint",
+            "More than 1000 log lines per minute"
+          ],
+          "answer": 2,
+          "explain": "Alert on symptoms users feel, not resource numbers that may be perfectly healthy. High CPU with every request succeeding in 40ms is not an incident."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Sentry Node.js SDK documentation",
+          "url": "https://docs.sentry.io/platforms/javascript/guides/node/"
+        },
+        {
+          "label": "PostHog documentation",
+          "url": "https://posthog.com/docs"
+        },
+        {
+          "label": "OpenTelemetry documentation",
+          "url": "https://opentelemetry.io/docs/"
+        },
+        {
+          "label": "Google SRE Book (monitoring, alerting, practices)",
+          "url": "https://sre.google/sre-book/table-of-contents/"
+        },
+        {
+          "label": "roadmap.sh DevOps track",
+          "url": "https://roadmap.sh/devops"
+        }
+      ],
+      "trap": {
+        "title": "The health check that lies",
+        "content": "Bring up your API with compose, confirm `/health` returns 200, then stop only the database container with `docker compose stop db`.\n\nCall `/health` again. Still 200. Still green. If a platform were watching this endpoint to decide whether your container is healthy, it would keep routing traffic to a process that cannot answer a single real request, and your uptime dashboard would show a perfect day while every user saw an error.\n\nNow call `/ready`, which runs `select 1`. It returns 503 with a logged error, which is the truthful answer.\n\nKeep both, and be deliberate about what points at which. A restart policy should watch liveness, because restarting the API cannot fix a dead database and a restart loop makes recovery slower. Load-balancer routing and your alerting should watch readiness. Getting this backwards produces the worst possible outage: total user-facing failure with every monitor green, which is exactly the six-hour silence from the opening story."
+      }
+    },
+    "m6-5": {
+      "content": "## The problem\n\nTwo horror stories, both of which happen to somebody every week.\n\nThe first: you follow a tutorial, spin up a database instance to try RDS, get distracted, and never open the console again. Nothing tells you. Thirty-one days later a card is charged for an instance nobody queried once, plus its storage, plus its snapshots, plus a load balancer sitting in front of nothing. Two thousand dollars for a weekend experiment, because AWS's default posture is that a running resource is a resource you want.\n\nThe second is worse. Someone commits an access key pair to a repo that is public for ten minutes. Bots scrape new public commits for key patterns continuously, in seconds, not hours. The key had broad permissions because that was easier, so it launches expensive compute in eight regions for crypto mining. The bill is five figures. The key was still valid because it was created in 2022 and never rotated, since long-lived keys have no expiry unless you give them one.\n\nNeither story is about a hard part of AWS. Both are about the two things that are actually dangerous: **money** and **identity**.\n\n## The idea\n\nAWS is not a product, it is a warehouse of roughly two hundred rentable primitives, most of which exist for a company that is not yours. Treating \"learn AWS\" as the goal is how people spend six months and still cannot deploy an API. You need five things well, and you need to recognise the rest by name so you can read an architecture diagram without bluffing: a bill you control, an identity model, object storage, compute, and a database.\n\nThe closest analogy from your world is the Apple developer portal. Certificates, identifiers, provisioning profiles, capabilities: most of it you never touch and could not explain, yet you understand the identity model well enough to know why a build will not install. That is exactly the depth to aim for here.\n\n## In practice\n\n**Guardrails before anything else**, in this order.\n\n- Turn on MFA on the root account, then stop using it. Root is for billing and account settings, not work.\n- Create a budget with your real tolerance and email alerts at 50%, 80%, and 100% of forecast. Forecast alerts warn before the money is spent.\n- Enable a zero-spend alert, which fires the first time anything at all becomes billable. That is what catches the resource you forgot in a region you never look at.\n- Tag everything with a project name, and put teardown in your calendar.\n\n**Regions and availability zones.** A region is a geographic location; an availability zone is one isolated datacentre inside it. Two consequences: latency is physical, so a bucket in Virginia serving users in India is a real tax, and the console shows you one region at a time, which is precisely how a forgotten resource hides for a month.\n\n**IAM** deserves real study. A **user** is a long-lived identity with a password or access keys. A **role** is a set of permissions something *assumes* temporarily, receiving short-lived credentials. A **policy** says which actions are allowed on which resources.\n\n```json\n{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Effect\": \"Allow\",\n      \"Action\": [\"s3:PutObject\", \"s3:GetObject\"],\n      \"Resource\": \"arn:aws:s3:::vault-uploads-dev/users/*\"\n    }\n  ]\n}\n```\n\nThat is least privilege in practice: two verbs, one bucket, one prefix. Compare it with what people attach in a hurry, `\"Action\": \"s3:*\"` on `\"Resource\": \"*\"`, and notice that the lazy version is what turns a leaked credential into a company-ending event rather than an annoyance.\n\nThe rule that prevents story two: **your application should never hold a long-lived access key.** Code running on AWS gets a role attached to the compute (an instance profile on EC2, a task role on Fargate, an execution role on Lambda) and the SDK picks up rotating temporary credentials with no secret in your repo. CI is the same: GitHub Actions can assume a role via OIDC and receive credentials that expire in an hour instead of a permanent key in repository settings. If you are creating an access key, ask what role you should have created instead.\n\n**S3** is object storage, and the mental correction matters: it is not a filesystem. There are no directories, only keys containing slashes. You cannot append to an object, only replace it. Listing a prefix is a query that costs a request. In exchange you get effectively unlimited capacity, extreme durability, and per-object access control.\n\nThe pattern you know from Supabase Storage applies unchanged. Your API never proxies bytes; it signs a URL and the client uploads directly.\n\n```ts\nimport { S3Client, PutObjectCommand } from \"@aws-sdk/client-s3\";\nimport { getSignedUrl } from \"@aws-sdk/s3-request-presigner\";\n\nconst s3 = new S3Client({ region: \"ap-south-1\" });\n\nexport async function createUploadUrl(userId: string, fileId: string) {\n  const command = new PutObjectCommand({\n    Bucket: \"vault-uploads-dev\",\n    Key: `users/${userId}/${fileId}`,\n    ContentType: \"image/jpeg\",\n  });\n  return getSignedUrl(s3, command, { expiresIn: 60 });\n}\n```\n\nA presigned URL is a bearer token in a query string: whoever holds it has that permission until it expires. Keep expiries short, sign the narrowest key, never log the URL. Add lifecycle rules while you are there, since \"abort incomplete multipart uploads after 7 days\" and \"expire temp objects after 30 days\" are two lines that stop storage growing forever. And leave Block Public Access on: public buckets are among the most common sources of real data leaks, because public on an object store means indexed by search engines and scanned by bots, not \"hard to guess\".\n\n**EC2 vs managed.** An EC2 instance is a virtual machine, and renting one signs you up for OS patching, TLS, log rotation, monitoring agents, disk space, crash restarts, and a plan for replacing it. That is a job, and it is not yours. Fargate runs your container with no machine to babysit; App Runner and Railway take a repo or an image and give you a URL. The rule for a small team: use the highest-level option that does the job, and step down only when you hit a wall you can name.\n\n**RDS vs Supabase.** RDS is Postgres that you operate.\n\n| Concern | RDS | Supabase |\n|---|---|---|\n| The database | Postgres you configure (instance class, storage, IOPS) | Postgres, sized by plan |\n| Backups | You enable them; retention and PITR are your setup | On by default, PITR on paid plans |\n| Scaling reads | Read replicas you provision and route to | Read replicas on higher plans |\n| Connection limits | Fixed per instance class; add RDS Proxy | Supavisor pooler in front by default |\n| Auth, storage, realtime | Build or buy separately | Included and wired together |\n| Ceiling | Very high; every knob is yours | Lower, and you follow their upgrade path |\n\nThe honest trade: Supabase is RDS with the batteries and the boring decisions pre-made, which is right until you need a knob it does not expose (a specific extension, custom replication, VPC-only networking, a compliance requirement). Knowing RDS matters even while you use Supabase, because instance class, IOPS, PITR, replica lag, and connection limits all exist underneath and leak through the abstraction on a bad day.\n\n## In your world\n\nYou have already built the S3 pattern with a different vendor. The signed upload URL in `file-vault-api` is a presigned `PutObjectCommand` under another name, and scoping object keys per user is the same discipline as scoping a policy to `users/*`. Port that one function to real S3 and only two things are new: credentials come from a role instead of a service key, and the bucket's public-access setting is now your problem.\n\nAt work, Railway plus Supabase means someone else runs the EC2 and the RDS for you, and that is worth every rupee at your team's size. What matters is being able to defend the choice in a room. When someone senior asks \"why aren't we on AWS\", the answer is not \"Supabase is easier\", it is a list: RLS, auth, storage, and pooling are four systems we would otherwise operate; our data sits in one region near our users; and the day we need something Supabase cannot expose, the exit is a standard Postgres dump, because it is standard Postgres.\n\n## Watch out\n\n- The root account with no MFA and a stored card is the highest-consequence object in your setup. Lock it and walk away from it.\n- A key in a committed `.env`, a screenshot, or a Slack paste is compromised permanently, not temporarily. Rotation is the mitigation; roles are the fix.\n- Deleting an RDS instance offers to skip the final snapshot, and that dialog is easy to click through. Check backup retention too: 0 means no point-in-time recovery at all.\n- Cross-region setups cost latency and egress per gigabyte, and two identically named resources in two regions look like one in the console. When you tear down, check every region you have ever clicked into.",
+      "tasks": [
+        "Before creating any resource: enable MFA on the root account, create a budget with forecast alerts at 50/80/100 percent, and turn on a zero-spend alert.",
+        "Create an IAM role whose policy allows only s3:PutObject and s3:GetObject on one bucket prefix, then attempt an operation outside that prefix and read the AccessDenied error.",
+        "Create a bucket with Block Public Access on, generate a presigned upload URL from a small script, upload with curl, and confirm the URL stops working after it expires.",
+        "Add lifecycle rules that expire objects under a temp/ prefix after 30 days and abort incomplete multipart uploads after 7 days.",
+        "Write a one-page comparison of RDS and Supabase for your work backend covering backups and PITR, connection limits, read replicas, and what you would operate yourself.",
+        "Port the signed-upload function in file-vault-api to real S3 and note exactly which two things changed: where credentials come from, and who owns the bucket's public-access setting.",
+        "Delete every resource you created, then check Cost Explorer two days later to confirm spend returned to zero."
+      ],
+      "quiz": [
+        {
+          "q": "What should you do before creating your first AWS resource?",
+          "options": [
+            "Choose a region close to your users",
+            "Enable MFA on root and create a budget with forecast alerts, so a forgotten resource cannot bill silently for a month",
+            "Create an IAM user with AdministratorAccess for daily work",
+            "Request a service quota increase"
+          ],
+          "answer": 1,
+          "explain": "AWS assumes a running resource is a wanted resource and will not warn you. A budget alarm is the only thing that turns a forgotten instance into a notification instead of an invoice."
+        },
+        {
+          "q": "Why should application code use an IAM role rather than an access key pair?",
+          "options": [
+            "Roles have higher API rate limits",
+            "The SDK receives short-lived rotating credentials automatically, so there is no long-lived secret to commit, screenshot, or paste",
+            "Access keys cannot be scoped to specific resources",
+            "Roles are cheaper than keys"
+          ],
+          "answer": 1,
+          "explain": "Long-lived keys never expire on their own and bots scrape public commits within seconds. A role attached to the compute means there is no permanent secret anywhere to leak."
+        },
+        {
+          "q": "A presigned S3 URL is best understood as:",
+          "options": [
+            "A permanent public link protected by an unguessable path",
+            "A time-limited bearer capability: anyone holding it has that exact permission until it expires",
+            "A redirect that checks the caller's IAM identity at request time",
+            "An encrypted URL that only your SDK can decode"
+          ],
+          "answer": 1,
+          "explain": "The signature is the authorization. Keep expiries short, sign the narrowest key possible, and never log or forward the URL."
+        },
+        {
+          "q": "Which statement about S3 is correct?",
+          "options": [
+            "You can append bytes to an existing object",
+            "Folders are real containers with their own permissions",
+            "There are no real directories, only keys containing slashes, and objects are replaced rather than appended to",
+            "Listing objects is free because it reads local metadata"
+          ],
+          "answer": 2,
+          "explain": "Object storage is not a filesystem. Treating a prefix as a directory is a useful illusion, but no-append and per-request listing costs are the parts that change your design."
+        },
+        {
+          "q": "What is the honest trade when choosing Supabase over RDS?",
+          "options": [
+            "Supabase is not really Postgres, so migrating away means rewriting queries",
+            "RDS is faster because it has no pooler in front of it",
+            "Supabase pre-makes the boring operational decisions and bundles auth, storage, and pooling; RDS exposes every knob and hands you the operational work",
+            "RDS includes row-level security while Supabase does not"
+          ],
+          "answer": 2,
+          "explain": "Both are Postgres. You are choosing between fewer decisions with a lower ceiling and full control with real operational cost. Know which knob you would miss before switching."
+        }
+      ],
+      "resources": [
+        {
+          "label": "AWS IAM User Guide",
+          "url": "https://docs.aws.amazon.com/IAM/latest/UserGuide/"
+        },
+        {
+          "label": "Amazon S3 User Guide",
+          "url": "https://docs.aws.amazon.com/AmazonS3/latest/userguide/"
+        },
+        {
+          "label": "Amazon RDS User Guide",
+          "url": "https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/"
+        },
+        {
+          "label": "AWS Cost Management (budgets and alerts)",
+          "url": "https://docs.aws.amazon.com/cost-management/latest/userguide/"
+        },
+        {
+          "label": "roadmap.sh AWS track",
+          "url": "https://roadmap.sh/aws"
+        }
+      ],
+      "trap": {
+        "title": "The bucket you thought was private",
+        "content": "Use a brand-new bucket and a file containing the word `hello`. Never real data, never a real user's upload.\n\nUpload the object, then fetch its URL in a browser with no credentials and no signature. Access denied, as expected. Now turn off Block Public Access and add a bucket policy allowing `s3:GetObject` to everyone, the change people make when a tutorial says 'make the bucket public so the images load'. Refresh the URL. Your file appears.\n\nSit with what that means. No login, no token, no referrer check, no rate limit. The only thing between a stranger and every object in the bucket is that they have not guessed the key, and key patterns are guessable: sequential ids, email addresses, phone numbers, a passport scan under a user folder. Automated scanners look for exactly this, continuously, and every few months a company discovers its documents were world-readable for a year.\n\nRe-enable Block Public Access, remove the policy, confirm the URL is dead, then delete the bucket. Then commit to the rule: buckets stay private and access happens through presigned URLs or a CDN with a signed path. Public on object storage means indexed and scraped, not hard to find."
+      }
+    },
+    "m6-6": {
+      "content": "## The problem\n\nA post goes viral inside your app. The author has 50,000 followers, and every one should get a push notification and a feed entry. The `POST /posts` request that started it is still open, waiting, while your code loops through follower rows and calls the push provider one at a time. At around 30 seconds the load balancer gives up, the app shows \"Something went wrong\", and the author taps Post again. Now you have two posts and 60,000 half-sent notifications.\n\nThe second problem is quieter and arrives the same day. Your feed is full of images, served by the API process, the one that also handles writes. One popular post means thousands of image requests hitting the same CPU that is trying to insert comments. Latency on everything doubles, nothing crashed, and every graph is a mystery until you notice that 90% of your traffic is bytes that never change.\n\n## The idea\n\nBoth problems have one shape: **work that does not belong in the request path.** You already know the fix for the first, because you have written it. A queue takes the job off the request, a separate worker does it slowly and safely, and the request returns in 40ms. AWS's version is the same idea with the servers rented out: SQS is the queue, Lambda or a container is the worker.\n\nThe second is the delivery half. A CDN keeps copies of your static bytes in a hundred cities and answers from the nearest one, so the request never reaches your API at all. For a mobile client on a phone network that is often a bigger perceived win than any code optimisation you will ever make.\n\nFor Lambda, the model that helps: a function that gets a whole small machine for one event, then vanishes. The catch is the **cold start**. With no warm machine, AWS must create one, load your code, and initialise it, adding tens to hundreds of milliseconds before your handler begins. Same phenomenon as a cold app launch after install: the first user pays for it, and on a mobile client it lands as a spinner that appears sometimes and not others, which is the hardest kind of slowness to debug.\n\n## In practice\n\nA Lambda handler takes an event and returns a response. With API Gateway in front, the event is an HTTP request.\n\n```ts\nexport async function handler(event: { body: string | null }) {\n  const payload = JSON.parse(event.body ?? \"{}\");\n  await doSomething(payload);\n  return { statusCode: 202, body: JSON.stringify({ accepted: true }) };\n}\n```\n\nServerless is right for spiky or rare traffic (a webhook receiver getting 40 calls a day), event-driven glue (an object landed in S3, make a thumbnail), and scheduled work. A long-lived process is simpler for steady traffic, anything needing a warm connection pool, WebSockets, or work over the 15-minute maximum. \"Scales to zero\" is a real saving on an idle service and a real latency penalty on a user-facing one, so choose per workload.\n\n**SQS** maps onto what you already have, almost one to one.\n\n| BullMQ / pg-boss | SQS | What it means |\n|---|---|---|\n| Queue | Queue | Durable list of messages waiting for a worker |\n| Job lock duration | Visibility timeout | How long a claimed message is hidden from other consumers |\n| Failed jobs, retry limit | Redrive policy plus DLQ | After N failures the message moves to a dead-letter queue |\n| Job data | Message body (256KB max) | Bigger payloads go to S3 and you send the key |\n| At-least-once delivery | At-least-once delivery | The same message can arrive twice. Plan for it. |\n\nThat last row bites. At-least-once means a hiccup at the wrong moment causes redelivery, so every handler must be idempotent: running it twice produces the same result as running it once.\n\n```ts\nexport async function sendReceipt(db: Db, orderId: string) {\n  const claimed = await db.claimOnce(\"receipt\", orderId); // insert ... on conflict do nothing\n  if (!claimed) return;                                   // already sent, this is a redelivery\n  await mailer.send(orderId);\n}\n```\n\nThe visibility timeout is the other trap: if your handler takes 90 seconds and the timeout is 30, SQS assumes the worker died and hands the message to another consumer while the first is still working. Two workers, one job, and if that job charges a card you have a support ticket. Set the timeout above your realistic worst-case runtime, or extend it while working.\n\n**SNS** is fan-out: one publish, many subscribers. Where SQS delivers one message to one consumer, SNS pushes a copy to every subscribed queue, function, or endpoint. Use it when several unrelated things must react to one event, such as \"user deleted\" reaching billing, search indexing, and audit logging without any of them knowing about each other. The common shape is SNS into several SQS queues, so each consumer keeps its own retries and its own DLQ.\n\n**EventBridge Scheduler** is cron, managed. `cron(0 3 * * ? *)` runs at 03:00 UTC daily and invokes a function or drops a message on a queue. It replaces the undocumented crontab on one server, and unlike that server it does not disappear when the instance is replaced. The gotcha is any cron's gotcha: overlapping runs and skipped runs are yours to make safe, which means idempotent handlers again.\n\nNow the delivery edge. **CloudFront** is the CDN, usually in front of an S3 bucket for media. Cache behaviours are rules matched by path: `/images/*` caches aggressively for a year, `/api/*` forwards to the origin with caching off. The reason static assets should never touch your API is arithmetic: a cached response costs nothing and returns in 20ms from a nearby city, while the uncached one burns a database connection and a CPU slice. Put a content hash in asset filenames so you can cache for a year and still deploy changes, exactly like a hashed JS bundle.\n\n**Route 53** is DNS, and a handful of record types matter.\n\n| Record | What it does | When you use it |\n|---|---|---|\n| A | Name to an IPv4 address | A server with a fixed IP |\n| ALIAS | Name to an AWS resource, at the zone apex | The bare domain to a load balancer or CloudFront |\n| CNAME | Name to another name | An api subdomain to a platform-provided hostname |\n| TXT | Arbitrary text | Domain verification, SPF and DKIM for email |\n| TTL | How long resolvers may cache the answer | Drop it to 60s a day *before* a planned cutover |\n\nThat TTL row is the practical lesson. With a 24-hour TTL, moving your API to a new host means some users keep hitting the old address for a day, and you cannot undo it afterwards. Lower the TTL first, wait for the old one to expire, then cut over.\n\n**ACM** issues free TLS certificates and renews them automatically, provided you validated by DNS and left the validation record in place. Two facts: a certificate used by CloudFront must live in `us-east-1` regardless of where everything else runs, and auto-renewal silently fails if that validation record was deleted, which is how a certificate expires at 2am on a Sunday.\n\nHere is `file-vault-api` on AWS instead of Supabase, end to end:\n\n- The app resolves your api hostname through Route 53 to CloudFront, which holds an ACM certificate and forwards `/api/*` to a load balancer.\n- The API runs as a container on Fargate with a task role, reading secrets from Parameter Store at boot.\n- Uploads: the client asks the API for a presigned S3 URL and uploads directly. Bytes never touch your compute.\n- S3 fires an object-created event to SQS. A Lambda consumes it, generates thumbnails, writes them back, and updates the row in RDS.\n- Failures after three attempts land in a DLQ with an alarm on queue depth, because a DLQ nobody watches is a folder of lost work.\n- Downloads: `/images/*` comes from CloudFront over S3 with a long cache and a hashed key. The API is not involved.\n- EventBridge runs a nightly job deleting orphaned objects and expired share links.\n\nCompare that with what you built: Supabase Storage replaced S3 plus presigned URLs plus CloudFront, BullMQ on Redis replaced SQS plus Lambda, Supabase Postgres replaced RDS, and a scheduled job replaced EventBridge. Seven AWS services, or four dependencies. Neither is wrong, but now you can read the diagram and say which boxes you would keep.\n\n## In your world\n\nYour work backend is this architecture with different labels: an API process, pg-boss queues for deferred work, a second queue instance for feed fan-out, and object storage for media. The viral-post problem above is literally what a feed fan-out job exists to solve, and the reason there are two queue instances is that heavy fan-out must not starve the queue that sends notifications. That is the same reasoning behind SNS into multiple SQS queues, arrived at independently.\n\nTake the idempotency point back to `marketplace-api` for a sharp exercise. Any handler that charges money or sends mail must survive being delivered twice, and the fix is not making delivery exactly-once (nobody has that) but a uniqueness constraint in your own database that turns the second attempt into a no-op. That habit is what separates a queue you trust from one you babysit.\n\n## Watch out\n\n- At-least-once delivery is the contract, not an edge case. A handler that is not idempotent is a bug waiting for a network blip.\n- A visibility timeout shorter than the handler's runtime causes concurrent duplicate processing, and it fails silently until the day the work is expensive. A DLQ with no alarm on depth and message age is a graveyard.\n- Lambda plus a relational database is a connection-count problem: hundreds of concurrent invocations each opening a Postgres connection exhaust the limit. That is what RDS Proxy, and Supavisor on Supabase, exist for.\n- Never let a CDN cache an authenticated response. A personalised endpoint behind CloudFront without the right cache key and `Authorization` handling serves one user's data to the next. That is a breach, not a caching bug.",
+      "tasks": [
+        "Write down the mapping between the queue you already use and SQS from memory (queue, visibility timeout, DLQ, message size limit, delivery guarantee), then check it against the docs.",
+        "Make one existing job handler idempotent using a uniqueness constraint in your own database, then invoke it twice with the same payload and confirm the second run is a no-op.",
+        "Set a job lock duration shorter than the handler's runtime in BullMQ, run it, and observe the same job processed twice concurrently. Then fix it and note what the fix was.",
+        "Sketch file-vault-api on AWS as boxes and arrows: CloudFront, load balancer, Fargate, presigned S3 upload, S3 event to SQS, Lambda thumbnailer, DLQ with an alarm, EventBridge cleanup, RDS.",
+        "For each box in that sketch, name what you actually used in the Supabase version and say which you would keep if you rebuilt it today.",
+        "Write the cache policy you would use for /images/* versus /api/*, and explain in one sentence why caching an authenticated response is a breach rather than a bug.",
+        "List the DNS records for an api subdomain plus a zone apex, and write the TTL steps you would take the day before a host cutover."
+      ],
+      "quiz": [
+        {
+          "q": "Your SQS visibility timeout is 30 seconds and the handler usually takes 90. What happens?",
+          "options": [
+            "The message fails and moves to the DLQ after the first attempt",
+            "SQS extends the timeout automatically while the consumer is connected",
+            "The message becomes visible again mid-run and a second consumer starts processing it concurrently",
+            "The queue rejects new messages until the handler finishes"
+          ],
+          "answer": 2,
+          "explain": "The visibility timeout is a bet on how long the work takes. Set it under the real duration and you get concurrent duplicate processing, invisible until the job charges a card or sends mail."
+        },
+        {
+          "q": "SQS guarantees at-least-once delivery. What does that require of your handlers?",
+          "options": [
+            "That they run inside a transaction",
+            "That they are idempotent, so a redelivery of the same message produces the same end state",
+            "That they complete within 15 minutes",
+            "That they acknowledge the message before doing any work"
+          ],
+          "answer": 1,
+          "explain": "Duplicates are the contract, not an edge case. Exactly-once delivery is not on offer, so the guard belongs in your database as a uniqueness constraint you check first."
+        },
+        {
+          "q": "Billing, search indexing, and audit logging must all react to one 'user deleted' event, each with its own retries. What fits best?",
+          "options": [
+            "One SQS queue that all three consumers poll",
+            "SNS publishing to three SQS queues, one per consumer",
+            "Three direct Lambda invocations from the API request",
+            "One Lambda that calls all three systems in sequence"
+          ],
+          "answer": 1,
+          "explain": "SNS fans one publish out to many subscribers, and giving each its own queue means independent retry behaviour and its own DLQ, with none of them knowing the others exist."
+        },
+        {
+          "q": "Why is Lambda plus a relational database a known trap?",
+          "options": [
+            "Lambda cannot open TCP connections",
+            "Postgres allocates a process per connection, so hundreds of concurrent invocations exhaust the connection limit and unrelated requests start failing",
+            "Lambda's 15-minute limit is too short for SQL queries",
+            "Connections from Lambda are not encrypted by default"
+          ],
+          "answer": 1,
+          "explain": "Each invocation wants its own connection and shares no pool. That is what RDS Proxy exists for, and it is the same problem Supavisor solves in transaction mode on Supabase."
+        },
+        {
+          "q": "Which is true about ACM certificates used by CloudFront?",
+          "options": [
+            "They must be issued in the us-east-1 region regardless of where the rest of your stack runs",
+            "They must be issued in the same region as your origin",
+            "They renew automatically even if the DNS validation record is deleted",
+            "They must be renewed manually every 13 months"
+          ],
+          "answer": 0,
+          "explain": "CloudFront reads certificates from us-east-1 only. And auto-renewal depends on the DNS validation record staying in place, which is how a certificate expires at 2am on a Sunday."
+        }
+      ],
+      "resources": [
+        {
+          "label": "AWS Lambda Developer Guide",
+          "url": "https://docs.aws.amazon.com/lambda/latest/dg/"
+        },
+        {
+          "label": "Amazon SQS Developer Guide",
+          "url": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/"
+        },
+        {
+          "label": "Amazon CloudFront Developer Guide",
+          "url": "https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/"
+        },
+        {
+          "label": "Amazon Route 53 Developer Guide",
+          "url": "https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/"
+        },
+        {
+          "label": "roadmap.sh AWS track",
+          "url": "https://roadmap.sh/aws"
+        }
+      ],
+      "trap": {
+        "title": "The job that ran twice",
+        "content": "You do not need AWS for this one. In BullMQ, create a handler that logs a line, sleeps 20 seconds, then inserts a row. Configure the worker with `lockDuration: 5000`. Enqueue one job and watch the log.\n\nThe handler starts, and about five seconds later it starts again, because the lock expired and the queue concluded the first worker had died. One enqueue, two runs, two rows. Now imagine the insert is a payment capture, or a push notification to 50,000 people.\n\nFix it twice, and notice the two fixes differ in kind. The first is configuration: make the lock longer than the realistic worst-case runtime, or renew it while working. That is the SQS visibility timeout under another name. The second is design: add a uniqueness constraint keyed on the job's identity and have the handler exit early when the insert conflicts. Only the second fix survives a genuinely crashed worker, a redelivery, and a retry after a network timeout.\n\nThat is the whole lesson about at-least-once delivery. Tuning timeouts reduces duplicates; only idempotency makes them harmless."
+      }
+    },
+    "m6-7": {
+      "content": "## The problem\n\n11:04pm. Your phone buzzes: 5xx rate above 20%. Then a teammate's message, \"is the app down?\" Then a screenshot in a group chat, then a tweet with your app's name in it. You shipped a release at 10:41pm.\n\nYour heart rate is now the biggest risk in the system. There are twenty things you could do and you can only do one at a time. The instinct is to read the stack trace and find the bug, because that is what you are good at and because understanding feels like progress. Tonight that instinct is wrong. Every minute spent understanding is a minute a few hundred people cannot use the app, and you already know enough to make them stop hurting.\n\n## The idea\n\nAn incident is not a debugging session. It is a different activity with a different goal: **reduce user impact first, understand later.** You already run this playbook on mobile without naming it. A crash spike appears after a release, you halt the staged rollout at 5%, and only then open the stack trace. Halting is not the fix and you know it. It is triage.\n\nBackend incidents differ in two ways. You can deploy in three minutes with nobody's approval, which makes it dangerously easy to fix forward into a second, worse outage. And data damage accumulates: a mobile crash loses a session, but a broken write path puts wrong rows in your database for as long as it runs, and those rows outlive the fix.\n\nThe sequence, every time: **detect, assess, stop the bleeding, communicate, then diagnose.**\n\n## In practice\n\n**Detect.** You cannot respond to what you cannot see, which is why observability came first. If the first report came from a user, the postmortem has an action item before the incident even ends.\n\n**Assess blast radius in under two minutes.** Three questions. How many users (all, one region, one app version, one cohort)? Which feature (one endpoint, one flow, everything)? And the one people skip: is it getting worse, holding steady, or already recovering? A flat 2% error rate on one endpoint and a climbing 40% across all of them are different nights. Write the answers in the channel as you get them, because that becomes the timeline you need tomorrow.\n\n**Stop the bleeding.** Pick the fastest mitigation, not the most correct one.\n\n| Situation | First move |\n|---|---|\n| Started right after a deploy | Revert to the previous release |\n| One feature, and it is behind a flag | Turn the flag off |\n| One endpoint timing out under load | Rate-limit or disable that endpoint |\n| A job handler failing and retrying forever | Pause the queue before it hammers the DB |\n| Database at a connection or CPU limit | Shed load: pause workers first, they are not user-facing |\n\nNote what is not on the list: \"look at the code\". A revert is the highest-leverage action available because it moves the system to a state that was known good twenty minutes ago and requires no theory about what broke. If you shipped in the last hour and errors began when you shipped, the deploy is your suspect, and you do not need to prove it before reverting.\n\n**The migration case.** Reverting code is cheap. Reverting a schema change is not, and sometimes it is impossible: a dropped column takes its data with it, and a `NOT NULL` backfill over ten million rows takes twenty minutes to undo. This is where expand/contract earns its existence. If the migration was additive, the old code still works against the new schema and a code revert is a complete fix. If it was not, you are choosing between fixing forward under pressure and restoring from backup, both bad at 11pm.\n\nIf a migration failed halfway, establish three facts before touching anything: which statements committed (check the migration history table and the actual schema, not the migration file), whether the new code is live, and whether the database is in a state the old code can serve. Then choose deliberately, rolling the code back to match the schema that exists or writing a small forward migration to complete the intended state. Do not re-run the same migration hoping it is idempotent, and do not edit a migration file that already partially ran.\n\n**Triage across processes.** With an API, a worker, and scheduled jobs, \"the backend is broken\" has at least three meanings, and the symptom tells you where to look.\n\n- Users see errors immediately on an action: the API. Check error rate and the recent deploy.\n- Users see stale or missing data with no errors: a worker. Check queue depth, failed job count, time since the last completed job.\n- One feature is stale on a daily rhythm: scheduled jobs. Check whether the schedule ran at all.\n- Everything is slow at once: a shared dependency. Database connections, CPU, or the pooler.\n\nQueue depth climbing while the API looks perfectly healthy is the classic invisible incident, and with more than one queue instance you check each separately. A job enqueued on the wrong instance has exactly this signature: no error anywhere, and work that silently never happens.\n\n**Communicate on a schedule.** Post an update every 20 to 30 minutes even with nothing new, because silence gets filled with speculation and individual pings that cost you the attention you need. Three sentences is enough: what users are experiencing, what you are doing, when you will next update. \"Still investigating, next update at 11:45\" is a complete message. Say what is affected, not what you hope, and never say \"fixed\" until the graph agrees. The moment a second person joins, split roles: one on the keyboard, one communicating, one deciding. When everyone debugs, two people run conflicting commands and nobody talks to the team.\n\n**Then diagnose, and write it down.** A postmortem is useful when it changes the system and theatre when it produces feelings. The format that works:\n\n- A timeline with timestamps: bad deploy, first alert, first human action, mitigation, resolution. Detection time and mitigation time are your two real metrics.\n- Impact in user terms: \"roughly 900 users could not post for 34 minutes\", not \"elevated error rates\".\n- Root cause as a causal chain, asking why past the first answer. \"A null got through\" is not a root cause. \"Validation lived in the route, that path bypassed the route, and no test covered it\" is.\n- Action items with an owner, a date, and a ticket, each one a change to code, config, tests, or alerting.\n\nBlameless is not politeness, it is engineering. \"Aswin should have been more careful\" produces nothing, because everyone was already trying. \"That column could be dropped in one migration and CI allowed it\" produces a check that fails the PR. When human error caused an outage, the finding is that the system permitted it: no guard, no alert, no review step, no rollback path. As the person becoming tech lead you set that tone, and the moment a postmortem sounds like a search for who, people start hiding incidents from you. Then you are back to finding out six hours late.\n\n## In your world\n\nYour pipeline shapes your rollback path, so know it cold before you need it. Merging to `main` is the production deploy, so the rollback is a revert commit that itself goes through a PR into `main`, and merging it deploys again. That is a few minutes of process at the worst possible time, which is why you should already know who can approve at 11pm and whether reverting the merge or the individual commits is the cleaner diff. CI applies pending migrations on the way in and does not un-apply them on the way out, so a code revert never undoes a schema change.\n\nTwo habits to build now. Before merging a release into `main`, write the rollback plan in the PR description in one line: \"revert this merge; migrations are additive so the previous build runs fine\". If you cannot write that sentence honestly, the release is not shaped correctly yet. Second, when you triage, route the symptom to the right process before opening any code: API error rate, then queue depth on each queue instance, then scheduled jobs. The whole point of having a debug flow is that at 11pm you follow a list instead of improvising.\n\n## Watch out\n\n- Diagnosing before mitigating is the most common mistake and feels like the responsible choice every time. Set a rule: no reading code until impact is reduced or you have decided it cannot be.\n- A rollback that reverts code but leaves an incompatible schema is not a rollback. Check what the migration did before assuming the revert is complete.\n- \"We will be more careful\" and \"add more monitoring\" are not action items. An action item has a ticket, an owner, a date, and a specific artefact that changes.\n- Do not close the incident when the graph recovers. Check the damage: rows written wrong, notifications not sent, jobs dropped. Cleanup is part of the incident, and users notice missing side effects days later.\n\n## Checkpoint\n\nAnswer these out loud, cold, no notes, as if to a teammate who will act on your answer tonight.\n\n1. Your API is throwing 500s on one endpoint and you shipped 20 minutes ago. Name your first three actions in order and defend the order. Why is reading the stack trace not first?\n2. A migration is halfway applied and the deploy failed. Walk through exactly what you check, in what order, and how you decide between rolling back and rolling forward.\n3. Why does p99 latency matter more than average latency? Give a concrete example where the average looks healthy and users are suffering.\n4. What makes a postmortem useful rather than theatre? Give one action item that is real and one that only looks real, and explain the difference.\n5. On your team, merging to `main` deploys production. What do you do differently on that PR compared with a PR into `dev`, and what is your rollback path at 11pm?\n6. Users report stale data but your API error rate is flat at zero and latency is normal. Where do you look, and which specific numbers do you ask for?",
+      "tasks": [
+        "Write your own one-page incident runbook: detect, assess, mitigate, communicate, diagnose, with the specific commands and dashboards you would open at each step for your work backend.",
+        "For the last release you were involved in, write the rollback sentence that should have been in the PR description, and check honestly whether it was true.",
+        "List every migration in a recent release and mark each additive or not. For any that are not, write what the safe two-release version would have been.",
+        "Write your triage decision table: users see errors, users see stale data, one feature is stale daily, everything is slow. Include the exact number you would check first for each.",
+        "Draft three incident update messages for a fictional 40-minute outage at t+5, t+25, and t+45 minutes, including one where you have nothing new to report.",
+        "Write a postmortem for a bug you shipped, using the timeline, impact-in-user-terms, causal-chain, action-items format. Every action item needs an owner, a date, and an artefact that changes.",
+        "Run the drill in the trap below on a dev environment and record your detection time and mitigation time with an actual stopwatch."
+      ],
+      "quiz": [
+        {
+          "q": "Errors spike on one endpoint 20 minutes after your deploy. What is the first action?",
+          "options": [
+            "Open the stack trace and find the bug, so the fix is correct",
+            "Revert to the previous release, because it moves the system to a known-good state without needing a theory",
+            "Scale up the service in case it is load-related",
+            "Ask users to force-quit and reopen the app"
+          ],
+          "answer": 1,
+          "explain": "Mitigate before you diagnose. A revert requires no understanding and stops the bleeding in minutes; the stack trace will still be there afterwards."
+        },
+        {
+          "q": "You revert the code but the release also ran a migration. When is the revert a complete rollback?",
+          "options": [
+            "Always, since migrations are separate from application code",
+            "Only when the migration was additive, so the previous build still runs correctly against the schema that now exists",
+            "Only if the migration ran inside a transaction",
+            "Never; you must always restore from a backup"
+          ],
+          "answer": 1,
+          "explain": "CI applies migrations on the way in and does not un-apply them on the way out. An additive change leaves the old code working, which is why expand/contract is an availability practice."
+        },
+        {
+          "q": "Users report stale data. API error rate is zero and latency is normal. Where do you look first?",
+          "options": [
+            "The database, since the data is wrong",
+            "The mobile app's cache, since the API is healthy",
+            "The background workers: queue depth, failed job count, and time since the last completed job",
+            "The CDN, since it may be caching the API response"
+          ],
+          "answer": 2,
+          "explain": "Stale data with no errors is the signature of work that never ran. A healthy API says nothing about the worker, and with more than one queue instance you check each separately."
+        },
+        {
+          "q": "Which is a real postmortem action item?",
+          "options": [
+            "The team will review migrations more carefully in future",
+            "Add a CI check that fails any PR containing a destructive ALTER, owned by a named person, due next Friday, tracked in a ticket",
+            "Improve monitoring across the platform",
+            "Everyone should read the deploy checklist again"
+          ],
+          "answer": 1,
+          "explain": "An action item is a change to code, config, tests, or alerting with an owner and a date. Intentions to be more careful change nothing, because everyone was already trying."
+        },
+        {
+          "q": "Twenty-five minutes into an incident you have learned nothing new. What do you post?",
+          "options": [
+            "Nothing, to avoid adding noise until there is real information",
+            "An update saying what users are experiencing, what you are doing, and when the next update comes, even though nothing changed",
+            "A request for other engineers to join and help investigate",
+            "A best guess at root cause so people feel informed"
+          ],
+          "answer": 1,
+          "explain": "Silence gets filled with speculation and individual pings that cost you the attention you need. A three-sentence 'still on it, next update at 11:45' is a complete message."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Google SRE Book (managing incidents, postmortem culture)",
+          "url": "https://sre.google/sre-book/table-of-contents/"
+        },
+        {
+          "label": "Google SRE Workbook (incident response practices)",
+          "url": "https://sre.google/workbook/table-of-contents/"
+        },
+        {
+          "label": "Sentry alerts documentation",
+          "url": "https://docs.sentry.io/product/alerts/"
+        },
+        {
+          "label": "roadmap.sh DevOps track",
+          "url": "https://roadmap.sh/devops"
+        }
+      ],
+      "trap": {
+        "title": "The drill",
+        "content": "Reading a runbook teaches you nothing about how you behave at 11pm. Run the drill instead, on a dev environment, with a teammate's agreement, and never on production.\n\nHave someone break the dev environment without telling you how. Good options: deploy a change that throws on one endpoint, point a connection string at a database that refuses connections, or stop the worker process so jobs pile up silently. Then start a stopwatch and work the sequence.\n\nMeasure two numbers. **Detection time**: how long from breakage to you knowing, and crucially whether you learned it from an alert or from a person. **Mitigation time**: how long until impact would have stopped for users. Write both down, then write down the moment you first opened a code file, and check whether that came before or after mitigation.\n\nAlmost everyone fails the same way first time: they read code within the first minute because it feels productive, and mitigation slips ten minutes later than it needed to. That instinct only changes with reps, which is the point of drilling. And if detection depended on a human telling you, you do not have a response problem yet, you have a monitoring gap, which is the first action item from a drill that has not yet involved a single real user."
+      }
+    },
+    "sq-9": {
+      "content": "## The problem\n\nYou can explain IAM, S3, and RDS from the AWS modules. That is not the same as having a public URL that serves your own API over TLS from infrastructure you assembled. The gap between those two states is where most people's AWS knowledge quietly stops being real.\n\n## The idea\n\nTake one project live, all the way to a domain you could hand to someone, then delete every piece of it. The teardown is half the exercise: the skill you are building is running an experiment on infrastructure that bills by the hour without leaving a tail behind. Pick `task-manager-api` for the shortest path, or `file-vault-api` if you want S3 in the story.\n\n## In practice\n\nGuardrails first: a budget with forecast alerts, MFA on root, one shared project tag on every resource, and a calendar reminder for teardown two days out.\n\n1. **Database.** RDS Postgres, smallest instance class, single AZ, not publicly accessible. Run your existing migrations against it and note the endpoint, port, and security group.\n2. **Secrets.** `DATABASE_URL` and your JWT secret as SecureString parameters in Parameter Store. Nothing in a committed file.\n3. **Compute.** Build the image from the Dockerfile you wrote on day 37, push it to ECR, run it on Fargate behind an Application Load Balancer. Give the task a role scoped to exactly the S3 and Parameter Store access it needs, and create no access keys at all. EC2 is the alternative if you want to feel what you are being spared; you will spend the evening on the OS instead of the app.\n4. **Storage.** An uploads bucket with Block Public Access on, presigned URLs from the API, and bytes that never pass through your compute.\n5. **DNS and TLS.** A domain in Route 53, an ACM certificate validated by DNS, attached to the load balancer, with an ALIAS record pointing at it. Then load your health endpoint over `https` from your phone on mobile data.\n6. **Prove it.** Point your React Native app at the new base URL and complete a real flow: sign up, create a record, upload a file. Then kill the Fargate task and watch the platform replace it, which is where orchestration and graceful shutdown stop being abstractions.\n\nWrite down total time and total cost. Both are useful ammunition next time someone proposes moving off a managed platform.\n\n### Teardown checklist\n\nWork top to bottom, in every region you clicked into.\n\n- Delete the Fargate service, then the cluster. A service with a desired count above zero recreates tasks you delete.\n- Delete the load balancer and its target groups. They bill hourly with nothing behind them.\n- Delete the RDS instance, decide consciously about the final snapshot, then delete that snapshot too if you kept it.\n- Empty the S3 bucket, then delete it. A non-empty bucket refuses to delete.\n- Delete the ECR repository, since images are gigabytes and not free.\n- Delete NAT gateways and release Elastic IPs. A forgotten NAT gateway is one of the most expensive mistakes available to you.\n- Delete or set retention on CloudWatch log groups.\n- Delete the IAM roles, policies, and any user you created. Leftover permissions are a bigger risk than leftover cost.\n- Delete the hosted zone if you are not keeping the domain, since it bills monthly.\n- Two days later, confirm in Cost Explorer that yesterday's spend is zero. That confirmation is how you know you are done.\n\n## Watch out\n\n- Do not skip the budget alarm because it is only a weekend. Every horror-story bill started as a weekend.\n- Nothing here needs a long-lived access key. If you create one, you took a wrong turn.\n- Use throwaway data only. This is a practice deployment with practice-grade hardening and should never hold anything real.",
+      "tasks": [
+        "Set up billing guardrails and a teardown reminder before creating a single resource.",
+        "Deploy one practice project end to end: RDS Postgres, secrets in Parameter Store, the container on Fargate behind a load balancer, S3 for uploads, Route 53 plus an ACM certificate.",
+        "Point your React Native app at the new base URL and complete a real flow: sign up, create a record, upload a file.",
+        "Kill the running task, watch the platform replace it, and confirm your SIGTERM handling logged a clean shutdown.",
+        "Work the teardown checklist top to bottom in every region you touched, then confirm zero spend in Cost Explorer two days later."
+      ],
+      "quiz": [
+        {
+          "q": "Which leftover resource is most likely to produce a surprising bill after you think you have torn everything down?",
+          "options": [
+            "An empty S3 bucket",
+            "A NAT gateway or an unattached Elastic IP",
+            "An IAM role with no attached policy",
+            "A deleted RDS instance's parameter group"
+          ],
+          "answer": 1,
+          "explain": "Empty buckets and idle roles cost nothing. NAT gateways bill hourly plus data processing, and load balancers bill with nothing behind them, which is why they head the checklist."
+        },
+        {
+          "q": "How should the Fargate task get its database credentials?",
+          "options": [
+            "Baked into the container image at build time",
+            "From an access key pair stored in an environment variable",
+            "From Parameter Store, read at boot using the task role, with no long-lived key anywhere",
+            "Passed as a command-line argument in the task definition"
+          ],
+          "answer": 2,
+          "explain": "The task role gives the container short-lived rotating credentials to read the parameter. Nothing durable is stored in the image, the repo, or the environment."
+        },
+        {
+          "q": "Why does the exercise insist you tear everything down rather than leaving it running?",
+          "options": [
+            "AWS deletes idle resources after 30 days anyway",
+            "The skill being practised is running billable experiments without leaving a tail, and teardown is where that skill lives",
+            "A stopped stack cannot be reused later",
+            "Free tier credits do not apply to Fargate"
+          ],
+          "answer": 1,
+          "explain": "Anyone can click through a tutorial. Knowing exactly what you created, and removing all of it across every region, is the part that transfers to real work."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Amazon ECS (Fargate) Developer Guide",
+          "url": "https://docs.aws.amazon.com/AmazonECS/latest/developerguide/"
+        },
+        {
+          "label": "AWS Systems Manager (Parameter Store)",
+          "url": "https://docs.aws.amazon.com/systems-manager/latest/userguide/"
+        },
+        {
+          "label": "AWS Certificate Manager User Guide",
+          "url": "https://docs.aws.amazon.com/acm/latest/userguide/"
+        },
+        {
+          "label": "roadmap.sh AWS track",
+          "url": "https://roadmap.sh/aws"
+        }
+      ]
+    },
+    "sq-10": {
+      "content": "## The problem\n\nYou have used Supabase for weeks as \"Postgres with auth and storage attached\". Four of its features change architectural decisions rather than just saving typing, and not knowing them leads to two specific mistakes: writing a whole API route for something a 20-line function should handle, and exhausting a database connection limit with code that looks perfectly reasonable.\n\n## The idea\n\nGo one layer down on the platform you already depend on. What runs your code at the edge, what happens to a file after upload, what sits between your app and Postgres, and how you get a throwaway environment per pull request.\n\n## In practice\n\n**Edge Functions** are Deno functions deployed globally and invoked over HTTP. They beat a route in your own API in three cases: a third-party webhook that must respond fast from anywhere (payment providers care about your response time), work that must keep running while your main API is being redeployed, and small independent jobs you do not want coupled to your release cycle. They lose when the work needs your service layer, your validation schemas, or a warm connection pool. The runtime is Deno, so imports are URL-based and npm-shaped code needs adjusting. Write one that verifies a webhook signature and inserts a row, then compare it honestly with the same endpoint in your API and say which you would rather debug at 11pm.\n\n**Storage internals.** A bucket's objects have rows in a Postgres table, which is why storage access control is RLS on that metadata table rather than a separate permission system. That one fact explains most confusing storage bugs: your policy is a SQL policy. Public buckets serve bytes to anyone with the URL; private buckets need a signed URL with an expiry, the pattern you built in `file-vault-api`. Then the part people miss: transformation options let you request width, height, quality, and format on read. If you generate thumbnails in a job purely to serve smaller images, transformations may delete that pipeline entirely. Measure first, since transformed responses are cached but the first request for each variant is slower than a pre-made thumbnail.\n\n**Connection pooling with Supavisor.** Postgres allocates a process per connection, so a small instance tops out in the low hundreds. **Session mode** assigns a real connection for the life of the client connection and supports everything Postgres can do, including prepared statements, `LISTEN`, and session-level settings. **Transaction mode** returns the connection to the pool after each transaction, so a handful of real connections serve hundreds of clients, at the cost of session state.\n\nThis is why serverless is dangerous against a raw Postgres port. Two hundred concurrent invocations, each opening a connection and each vanishing before closing it cleanly, is two hundred connections against a limit of maybe a hundred, and the failure surfaces as `too many clients already` on a completely unrelated request. Long-lived processes with a bounded pool (your Express and Hono APIs) can use the direct connection safely, because the pool caps them. Short-lived or highly concurrent callers go through the transaction-mode pooler. Know which port your connection string uses.\n\n**Branching** gives a pull request its own Postgres instance with your migrations applied, so a reviewer can exercise a schema change against real structure instead of reading SQL and hoping. It is the database half of preview deploys, and the closest thing to a safe rehearsal for the append-only migration discipline you already follow: a migration that fails on a branch would have failed on its way to production.\n\nSpend your hour on the pooling section if you only have one. It is the part that shows up as a production incident.\n\n## Watch out\n\n- Edge Functions can run with elevated privileges. A function that trusts its input is an RLS bypass with a public URL in front of it.\n- Storage policies are RLS policies. If a file is readable by the wrong person, look at the policy on the objects table, not at the bucket setting.\n- Session mode and transaction mode use different ports. Copying a connection string from the wrong place gives you working code that fails only under concurrency.\n- A preview branch is a real database with real cost and a real lifetime. Close the branch when the PR closes.",
+      "tasks": [
+        "Write and deploy one Edge Function that verifies a webhook signature and inserts a row, then compare it honestly with the same endpoint written in your own API.",
+        "Serve an image through the storage transformation options at two widths and compare with the thumbnail job you built in file-vault-api, including first-request latency.",
+        "Read a bucket's row in the storage metadata table and write down which RLS policy governs access to it.",
+        "Connect to the same database twice, once directly and once through the transaction-mode pooler, and note which port each uses and what stops working in transaction mode.",
+        "Open a preview branch for a pull request, apply a migration on it, and confirm the branch database has the new schema while production does not."
+      ],
+      "quiz": [
+        {
+          "q": "Why does a highly concurrent serverless function exhaust a Postgres connection limit without a pooler?",
+          "options": [
+            "Serverless functions hold connections open for their full billing duration",
+            "Postgres allocates a process per connection, so hundreds of simultaneous invocations each wanting one blow past the limit and unrelated requests fail",
+            "Functions cannot reuse TLS sessions, so each query opens a new connection",
+            "The pooler is required to authenticate service-role credentials"
+          ],
+          "answer": 1,
+          "explain": "A long-lived process caps itself with a bounded pool. Many short-lived callers share no pool, so transaction-mode pooling in front is what keeps real connections low."
+        },
+        {
+          "q": "What do you give up in transaction mode compared with session mode?",
+          "options": [
+            "Nothing; transaction mode is strictly better",
+            "Session state: session-level settings, LISTEN, and some prepared-statement behaviour, because the connection returns to the pool after each transaction",
+            "The ability to run multi-statement transactions",
+            "Row-level security enforcement"
+          ],
+          "answer": 1,
+          "explain": "Transaction mode multiplexes many clients onto few real connections by handing the connection back at commit, so anything that assumed a durable session breaks."
+        },
+        {
+          "q": "When does an Edge Function genuinely beat a route in your own API?",
+          "options": [
+            "Whenever the logic is short enough to fit in one file",
+            "For a latency-sensitive third-party webhook that must respond from anywhere, or small work you do not want coupled to your API's release cycle",
+            "Whenever you need access to your service layer and validation schemas",
+            "For anything that needs a warm database connection pool"
+          ],
+          "answer": 1,
+          "explain": "The wins are geography, independence from your deploy cycle, and staying up while your API restarts. The losses are your service layer, your schemas, and pooled connections."
+        },
+        {
+          "q": "Storage access control in Supabase is enforced by:",
+          "options": [
+            "A separate permissions service in front of the object store",
+            "RLS policies on the Postgres table that holds object metadata",
+            "Bucket-level ACLs only, independent of the database",
+            "Signed URLs alone, with no server-side policy"
+          ],
+          "answer": 1,
+          "explain": "Objects have rows. That single fact explains most confusing storage bugs: your access rule is a SQL policy, so debug it like one."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Supabase Edge Functions",
+          "url": "https://supabase.com/docs/guides/functions"
+        },
+        {
+          "label": "Supabase Storage",
+          "url": "https://supabase.com/docs/guides/storage"
+        },
+        {
+          "label": "Supabase: connecting to Postgres and pooling modes",
+          "url": "https://supabase.com/docs/guides/database/connecting-to-postgres"
+        },
+        {
+          "label": "Supabase branching",
+          "url": "https://supabase.com/docs/guides/deployment/branching"
+        }
+      ]
+    }
+  }
+}

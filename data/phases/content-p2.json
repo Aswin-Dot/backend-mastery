@@ -1,0 +1,272 @@
+{
+  "phaseId": "p2",
+  "modules": {
+    "m2-1": {
+      "content": "## The problem\n\nAn endpoint that reads like this shipped in a real product last year:\n\n```json\nPOST /tasks\n{ \"userId\": \"9f3c...\", \"title\": \"Renew domain\" }\n```\n\nIt works perfectly. The app sends the id it got at login, the server writes the row, the list refreshes. Every test passes, because every test uses the app.\n\nThen a QA engineer copies the request out of the network tab to reproduce a bug, pastes it into a terminal, and changes one field: her teammate's user id, which she has from a shared test fixture. The task appears in his account. She tries the GET endpoint next and is reading his tasks. She reports it, which is the lucky version of this story.\n\nThe bug is not the missing check. The bug is that the endpoint asked the client who it was. A request is a text file anyone can write, your app is a bundle on a device you do not control, and `curl` does not care that you built a nice login screen.\n\n## The idea\n\nIdentity has to arrive in a form the sender cannot forge. That form is a signed token.\n\nA JWT is three base64 chunks separated by dots: a header saying which algorithm, a payload of claims, and a signature. The claims are not encrypted. Anyone can read them, including you, right now, with `atob(token.split('.')[1])`. What they cannot do is change one and keep the signature valid, because the signature was computed over the payload with a secret only the auth server holds.\n\nThe analogy is a festival wristband. The claims are printed on the outside where anyone can read your name and which zones you paid for. The hologram is the signature. A bouncer who **reads** the wristband has done nothing, because I can print a wristband. A bouncer who **checks the hologram** has done the entire job. In code, `decode` and `verify` look almost identical and differ by everything.\n\nThe payload carries a `sub` claim (the user id), an `email`, a `role`, and an `exp`. Your middleware's only job is to turn a verified token into `req.user`, and from then on no route ever asks the client who it is talking to.\n\n## In practice\n\nScaffold the folders you will actually use. The layout mirrors phase 0: routes handle HTTP, services hold logic, config holds startup wiring.\n\n```bash\ncd ~/Documents/WorkFolder/SharedProjects/node+supabase/task-manager-api\nmkdir -p src/config src/middleware src/routes src/schemas src/services\nnpm i express helmet cors zod pino pino-pretty dotenv @supabase/supabase-js\nnpm i -D typescript ts-node nodemon @types/node @types/express @types/cors\n```\n\n**`src/config/env.ts` runs before anything else and is allowed to kill the process.** Every environment variable is a string or missing, so coerce and default explicitly.\n\n```ts\nconst envSchema = z.object({\n  SUPABASE_URL: z.string().url(),\n  SUPABASE_SECRET_KEY: z.string().min(1),\n  PORT: z.coerce.number().default(3000),\n  NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),\n});\n\nconst parsed = envSchema.safeParse(process.env);\nif (!parsed.success) {\n  console.error('Invalid environment:', parsed.error.flatten().fieldErrors);\n  process.exit(1);\n}\n\nexport const env = parsed.data;\n```\n\nThree deliberate choices there. `safeParse` rather than `parse`, so you control the exit instead of throwing a stack trace at whoever started the process. `z.coerce.number()` because `process.env.PORT` is the string `'3000'`. And `console.error` rather than the logger, because the logger reads `env` and does not exist yet, and the process is about to die anyway. This is the one place that exception is honest.\n\nThe payoff is a changed failure mode: from \"random 500s three hours after deploy because a URL was empty\" to \"the container refused to start and the log says `SUPABASE_URL: Required`\".\n\n**`src/config/logger.ts`** gives you levels and structure. `pino` writes JSON with fields you can filter on, at `info` in production and `debug` locally, with `pino-pretty` making it readable in your terminal. It is not `console.log` because a log aggregator cannot filter a sentence, and `console.log` is synchronous and blocks the event loop under load.\n\n**`src/middleware/auth.ts`** is the whole lesson.\n\n```ts\nexport async function requireAuth(req: Request, res: Response, next: NextFunction) {\n  const header = req.headers.authorization;\n\n  if (!header?.startsWith('Bearer ')) {\n    res.status(401).json({ error: 'Missing or malformed Authorization header' });\n    return;\n  }\n\n  const token = header.slice('Bearer '.length);\n  const { data, error } = await supabase.auth.getUser(token);\n\n  if (error || !data.user) {\n    res.status(401).json({ error: 'Invalid or expired token' });\n    return;\n  }\n\n  req.user = { id: data.user.id, email: data.user.email ?? '' };\n  next();\n}\n```\n\n`getUser(token)` hands the token to Supabase's auth server, which checks the signature, checks `exp`, and checks whether the session was revoked. That third check is why this project calls out rather than verifying locally with the JWT secret. Local verification is faster, but a token from a user who logged out ten seconds ago still has a valid signature and an unexpired `exp`, so local-only verification honours it until it ages out. You are trading a round trip for the ability to log someone out. Know you are making the trade, because at high traffic you will make it the other way and add a cache.\n\nMount it in front of everything protected, once:\n\n```ts\nconst router = Router();\nrouter.use(requireAuth);\n\nrouter.post('/tasks', async (req, res) => {\n  const input = createTaskSchema.parse(req.body);\n  const task = await taskService.createTask(req.user!.id, input);\n  res.status(201).json(task);\n});\n```\n\n`req.user!.id` is the only place a user id enters your system. `createTaskSchema` does not have a `userId` field, so a client that sends one gets it ignored rather than honoured.\n\n## In your world\n\nYou are on both ends of this one. In your RN app the access token is short-lived and lives in memory or `expo-secure-store`, never in `AsyncStorage`, which is unencrypted on disk and readable from a rooted device or a backup. The refresh token is the long-lived credential and only ever travels to the refresh endpoint. On a 401 the client refreshes once, retries once, and signs the user out if that fails. You have consumed that flow for years; this week you own the other half.\n\nYour work backend has the identical shape in different clothes: an auth middleware runs before handlers, resolves the caller, and puts the result somewhere the handler can read, and handlers never take identity from the body. It goes one step further by deriving the request's database handle from that identity, which is day 32.\n\n## Watch out\n\n- Decoding is not verifying. If a code path reads claims out of a token without checking the signature, treat that token as user input.\n- `req.user!` is only safe because `router.use(requireAuth)` runs first. Mount a route above that line and the non-null assertion becomes a lie that crashes at runtime.\n- 401 means \"I do not know who you are\", 403 means \"I know who you are and you may not do this\". Sending 403 for a missing token teaches your client the wrong retry behaviour.\n- Never log the `Authorization` header, and never log the body of a login request. A token in a log file is a valid credential sitting in a place with looser access control than your database.\n- `cors()` with no options allows every origin. That is fine on day 11 and unacceptable on the day you deploy. Leave a TODO you will actually honour."
+      ,
+      "tasks": [
+        "Scaffold `task-manager-api` with the folders above, write `src/config/env.ts`, `src/config/logger.ts`, `src/config/supabase.ts`, `src/app.ts`, and `src/server.ts`, and get `npm run dev` printing a startup log line.",
+        "Delete `SUPABASE_URL` from your `.env`, start the server, and confirm it refuses to boot with a message naming the missing variable. Put it back.",
+        "Write `src/middleware/auth.ts`, then hit a protected route three ways: no header, `Authorization: Bearer garbage`, and a valid token. Confirm 401, 401, 200.",
+        "Sign up and log in via the Supabase auth endpoints, then paste the access token's middle segment into `atob()` in a Node REPL and read the `sub`, `role`, and `exp` claims out loud.",
+        "Change one character in the payload segment of a real token, re-send it, and confirm the request is rejected. That is the signature doing its job.",
+        "Verify that `createTaskSchema` has no `userId` field, then send a request whose body includes `userId` set to a different UUID and confirm the created task still belongs to the token's user."
+      ],
+      "quiz": [
+        {
+          "q": "Why can an endpoint never trust a `userId` sent in the request body, even when your own app is the only client?",
+          "options": [
+            "Because request bodies are not encrypted in transit",
+            "Because the body is arbitrary text that any caller can write, and your app is not the only thing that can send a request",
+            "Because Express parses the body after the route handler runs",
+            "Because JSON bodies cannot contain UUIDs safely"
+          ],
+          "answer": 1,
+          "explain": "An HTTP request is fully client-controlled. The only identity you can rely on is one carried by something the client cannot forge, which is why it comes from a verified token and nowhere else."
+        },
+        {
+          "q": "What is the difference between decoding a JWT and verifying it?",
+          "options": [
+            "Decoding requires the secret; verifying does not",
+            "They are the same operation with different names",
+            "Decoding just base64-reads the claims, which anyone can do; verifying recomputes the signature with the secret to prove the claims were not altered",
+            "Decoding checks expiry, verifying checks the payload shape"
+          ],
+          "answer": 2,
+          "explain": "JWT payloads are encoded, not encrypted, so reading them proves nothing. Only the signature check establishes that the token came from the auth server and has not been edited."
+        },
+        {
+          "q": "Why does this middleware call `supabase.auth.getUser(token)` instead of verifying the signature locally with the JWT secret?",
+          "options": [
+            "Local verification is impossible without the anon key",
+            "Because `getUser` also detects sessions that were revoked by logout, which a local signature check cannot see",
+            "Because local verification does not check expiry",
+            "Because the token is encrypted and only the auth server can read it"
+          ],
+          "answer": 1,
+          "explain": "A token from a logged-out session still has a valid signature and an unexpired `exp`. Asking the auth server catches revocation, at the cost of a network round trip per request."
+        },
+        {
+          "q": "Why validate environment variables at startup rather than where they are used?",
+          "options": [
+            "It reduces memory usage by parsing once",
+            "It converts a class of silent runtime failures into a loud, immediate boot failure that names the exact missing variable",
+            "`process.env` is read-only after the first access",
+            "It is required for Zod to infer types"
+          ],
+          "answer": 1,
+          "explain": "Fail fast and fail loud. A missing variable discovered at boot is a ten-second fix; the same variable discovered by a 500 on a code path nobody exercises until Friday night is an incident."
+        }
+      ],
+      "resources": [
+        { "label": "Supabase: Auth", "url": "https://supabase.com/docs/guides/auth" },
+        { "label": "Zod documentation", "url": "https://zod.dev" },
+        { "label": "MDN: HTTP Authentication", "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Authentication" },
+        { "label": "Express: Using middleware", "url": "https://expressjs.com/en/guide/using-middleware.html" },
+        { "label": "pino: structured logging", "url": "https://getpino.io/" }
+      ],
+      "trap": {
+        "title": "Trust the body once, on purpose",
+        "content": "Before you write the auth middleware, write the wrong version and feel it.\n\n1. Add a temporary route `POST /tasks-unsafe` that takes `userId` straight out of `req.body` and inserts the task with it. No `requireAuth`, no token.\n2. Create two accounts through the Supabase dashboard. Call them A and B, and copy both user ids.\n3. From your terminal, as nobody at all, create a task in A's account. Then create one in B's. Then list B's tasks and see the row you planted.\n\nYou did that with no credentials, no login, and no token, from a machine that has never authenticated. Every request looked completely normal in the logs.\n\nNow delete the route, write `requireAuth`, and repeat the attack. It should fail at the header check before your handler ever runs.\n\nWrite down one sentence answering this: what, specifically, made the first version exploitable? The answer is not \"a missing check\". It is that the endpoint accepted an *assertion* of identity where it needed *proof* of identity, and those two things arrive in a request looking exactly alike."
+      }
+    },
+    "m2-2": {
+      "content": "## The problem\n\nYour RN app does delta sync, because loading 2,000 tasks on every cold start is rude to a phone on 3G. The client stores the timestamp of its last successful sync and asks `GET /tasks?updated_since=2026-08-09T11:04:00Z`. Beautiful. Small payloads, fast startup, works offline.\n\nThen a teammate adds a \"mark all complete\" endpoint as a single bulk update. Separately, someone fixes twelve rows of bad data in the SQL editor. Neither set `updated_at`, because neither was thinking about a mobile sync protocol they had not read about. Those rows now have an `updated_at` in the past and an `is_completed` in the present, so they never reach a device again. The user marks everything complete, reopens the app, and sees the old state.\n\nYou will debug this in the mobile app for two days. The bug is in the database, and it is a bug of *omission by a human*, which means the fix is to remove the human.\n\n## The idea\n\nThere is a category of rule that must hold no matter who writes: your API, a bulk script, a migration, a colleague in the SQL editor, a second service that shows up next year. Application code cannot enforce that category, because application code is one of the writers.\n\nThe mobile analogy: validation inside a shared `TaskForm` component versus validation inside the reducer. Component-level works until someone dispatches the action from somewhere else, and someone always does. Put it in the reducer and there is one door.\n\nPostgres gives you three tools at that level. **Constraints** reject bad rows. **Triggers** run your code inside the write, so a rule applies to every statement that touches the row. **Indexes** are the read-side equivalent: a decision about access patterns that lives with the data instead of in each caller.\n\nAnd the container for all three is a **migration**: a timestamped SQL file, committed, applied in order, exactly once. A migration is a historical fact, not a draft. Once it has run somewhere, you never edit it, you write another one. The mental model is git: you do not rewrite a pushed commit, you add the next one.\n\n## In practice\n\nStart with `categories`, because `tasks` references it and a foreign key cannot point at a table that does not exist yet. Order inside a migration matters.\n\n```sql\nCREATE TABLE categories (\n  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),\n  user_id    uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,\n  name       text NOT NULL,\n  color      text NOT NULL DEFAULT '#6366f1',\n  created_at timestamptz NOT NULL DEFAULT now()\n);\n```\n\nThen `tasks`, where every line is a decision you can now defend out loud.\n\n```sql\nCREATE TABLE tasks (\n  id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),\n  user_id      uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,\n  category_id  uuid REFERENCES categories(id) ON DELETE SET NULL,\n  title        text NOT NULL,\n  description  text,\n  priority     smallint NOT NULL DEFAULT 0 CHECK (priority BETWEEN 0 AND 3),\n  due_date     date,\n  is_completed boolean NOT NULL DEFAULT false,\n  created_at   timestamptz NOT NULL DEFAULT now(),\n  updated_at   timestamptz NOT NULL DEFAULT now()\n);\n```\n\n`user_id` cascades because deleting an account should take its tasks. `category_id` sets null because deleting a label should not delete the work. `due_date` is `date` and not `timestamptz`, because \"due Tuesday\" is a calendar fact, not an instant, and storing it as an instant means it shifts across timezones. The `CHECK` on priority holds even when your Zod schema has a typo.\n\nNow the trigger that fixes the sync bug.\n\n```sql\nCREATE OR REPLACE FUNCTION set_updated_at()\nRETURNS TRIGGER AS $$\nBEGIN\n  NEW.updated_at = now();\n  RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;\n\nCREATE TRIGGER trigger_tasks_updated_at\n  BEFORE UPDATE ON tasks\n  FOR EACH ROW\n  EXECUTE FUNCTION set_updated_at();\n```\n\n`BEFORE UPDATE` because `NEW` is still editable before the write lands; an `AFTER` trigger would need a second `UPDATE` to change the row, which fires the trigger again. `FOR EACH ROW` because a bulk update of 500 rows must stamp 500 rows, not one. `RETURN NEW` hands the modified row back to Postgres to actually store.\n\nWhat you bought: it is now **impossible** to update a task without `updated_at` moving. Not \"unlikely if everyone remembers\". Impossible, for the API, the bulk endpoint, the SQL editor, and the service that does not exist yet.\n\nIndexes come last, and you derive them from queries rather than guessing. Write the three real ones down first:\n\n1. `WHERE user_id = $1 ORDER BY created_at DESC` — the default list.\n2. `WHERE user_id = $1 AND due_date BETWEEN $2 AND $3 ORDER BY due_date` — the Due This Week tab.\n3. `WHERE category_id = $1` — reachable from the chip, and it is a foreign key.\n\n```sql\nCREATE INDEX idx_tasks_user_id      ON tasks (user_id);\nCREATE INDEX idx_tasks_category_id  ON tasks (category_id);\nCREATE INDEX idx_tasks_user_due     ON tasks (user_id, due_date);\nCREATE INDEX idx_categories_user_id ON categories (user_id);\n```\n\nThe composite one earns its keep twice: it filters on `user_id` and returns rows already in `due_date` order, so the plan loses its `Sort` node. Note that `idx_tasks_user_id` is partly redundant with it, since a leftmost prefix of `(user_id, due_date)` already serves `WHERE user_id`. Keep both for now and revisit on day 24 with `EXPLAIN ANALYZE` in front of you.\n\n## In your world\n\nThis file lands at `supabase/migrations/001_create_categories_and_tasks.sql` and you apply it by pasting it into the Supabase SQL editor. Commit it before you run it, so the repository and the database change in the same motion.\n\nYour work backend adds ceremony for good reasons. New migrations are generated by a CLI command rather than hand-named, because the timestamp prefix determines ordering and a hand-typed one eventually collides or sorts wrong. Files are strictly append-only: editing one that has already run leaves the environments that ran the old text and the ones that will run the new text with different schemas, a divergence nobody discovers until something breaks in exactly one place. And every change is two-sided, because a Drizzle schema file describes the table to your code while the migration is what actually changes the database. Change one without the other and your types confidently describe a table that does not exist.\n\n## Watch out\n\n- Adding a `NOT NULL` column with no `DEFAULT` to a table that already has rows fails. Add it nullable, backfill, then add the constraint, in separate steps.\n- `CREATE INDEX` takes a lock that blocks writes for the duration. On a large production table use `CREATE INDEX CONCURRENTLY`, which cannot run inside a transaction block.\n- A row-level trigger runs once per affected row. Keep it cheap, and never make it do I/O.\n- Order statements so referenced tables exist first, and remember that a migration runs top to bottom in one shot.\n- Never renumber, rename, or edit a migration that has been applied anywhere other than your own laptop. Write the next one."
+      ,
+      "tasks": [
+        "Write `supabase/migrations/001_create_categories_and_tasks.sql` containing both tables, the trigger function, the trigger, and all four indexes, then apply it in the Supabase SQL editor.",
+        "Insert a task, note its `updated_at`, then run a raw `UPDATE tasks SET title = 'renamed' WHERE id = ...` directly in the SQL editor and confirm `updated_at` changed without you setting it.",
+        "Drop the trigger, repeat the same raw UPDATE, and confirm `updated_at` is now stale. Recreate the trigger and explain out loud which sync bug you just reproduced.",
+        "Try to insert a task with `priority = 7` and read the CHECK violation. Then try a `category_id` that does not exist and read the foreign key violation.",
+        "Delete a category and confirm its tasks survive with `category_id` null. Then delete the test user in the dashboard and confirm the tasks are gone.",
+        "Write a second migration `002_add_tasks_notes.sql` that adds a nullable `notes text` column, apply it, and confirm both migrations are in git before either was run anywhere else."
+      ],
+      "quiz": [
+        {
+          "q": "Why set `updated_at` with a database trigger rather than in your update service?",
+          "options": [
+            "Triggers are faster than an extra assignment in JavaScript",
+            "Because the rule then applies to every writer including bulk scripts, migrations, and manual SQL, none of which run your service code",
+            "Because `now()` is not available from application code",
+            "Because Postgres refuses to update timestamptz columns from a client"
+          ],
+          "answer": 1,
+          "explain": "Application code is one writer among several. A trigger moves the rule inside the write itself, which makes it impossible to update a row without stamping it, no matter who issued the statement."
+        },
+        {
+          "q": "Why `BEFORE UPDATE` and not `AFTER UPDATE` for the `updated_at` trigger?",
+          "options": [
+            "`AFTER` triggers cannot access the `NEW` record at all",
+            "`BEFORE` runs while `NEW` is still editable, so assigning to it changes what gets written; `AFTER` would require a second UPDATE which re-fires the trigger",
+            "`AFTER` triggers only run once per statement",
+            "`BEFORE` triggers are the only kind allowed on tables with RLS"
+          ],
+          "answer": 1,
+          "explain": "The row is written when a BEFORE trigger returns, so modifying `NEW` is free. After the write, the only way to change the row is another UPDATE, which is both wasteful and recursive."
+        },
+        {
+          "q": "You have `CREATE INDEX ON tasks (user_id, due_date)`. Which additional index is the most clearly redundant?",
+          "options": [
+            "`(category_id)`",
+            "`(user_id)`",
+            "`(due_date)`",
+            "`(user_id, is_completed)`"
+          ],
+          "answer": 1,
+          "explain": "A composite B-tree can be scanned on its leftmost prefix, so `(user_id, due_date)` already serves `WHERE user_id = $1`. A standalone `(user_id)` index is smaller so the planner may still prefer it, which is why you confirm with EXPLAIN rather than deleting on principle."
+        },
+        {
+          "q": "A migration that has already run on the shared dev database contains a typo in a column name. What do you do?",
+          "options": [
+            "Edit the file and re-run it",
+            "Delete the file and write a fresh one with the same timestamp",
+            "Write a new migration with a later timestamp that renames the column",
+            "Edit the file and reset the migration history table"
+          ],
+          "answer": 2,
+          "explain": "An applied migration is a historical fact. Editing it means environments that already ran the old text will never see the correction, so the schemas silently diverge. The fix is always the next migration."
+        }
+      ],
+      "resources": [
+        { "label": "PostgreSQL: CREATE TABLE", "url": "https://www.postgresql.org/docs/current/sql-createtable.html" },
+        { "label": "PostgreSQL: Trigger Procedures", "url": "https://www.postgresql.org/docs/current/plpgsql-trigger.html" },
+        { "label": "PostgreSQL: CREATE INDEX", "url": "https://www.postgresql.org/docs/current/sql-createindex.html" },
+        { "label": "Supabase: Local development and migrations", "url": "https://supabase.com/docs/guides/local-development" }
+      ]
+    },
+    "m2-3": {
+      "content": "## The problem\n\nThe most common serious hole in real APIs is not injection or a broken crypto choice. It is an endpoint that correctly authenticates you and then hands you somebody else's object because nobody scoped the lookup. It has a name: broken object-level authorization, and it sits at the top of the OWASP API list because it is so easy to ship.\n\nHere is how it happens on the project you are building. You write fourteen endpoints over two days. Thirteen of them filter by the caller's user id. One of them, `GET /tasks/:id`, was written at 11pm as a one-liner: find the row by primary key, return it. It passes every test, because every test asks for a task the test user owns. It passes review, because the diff is three lines and looks like the other thirteen. It ships. Nobody notices for a year, because the app never requests an id it did not receive from the list endpoint.\n\nThen someone requests one anyway.\n\n## The idea\n\nThere are two ways to say no, and they are not equivalent.\n\n**403 Forbidden** says: this exists, you may not have it. That is an answer, and it is information. It confirms the id is real, which is how attackers enumerate. **404 Not Found** says: there is no such thing. For another user's row, that is the truthful answer, because from your position in the system that row genuinely is not part of the world.\n\nRow-level security produces the second answer, at the database. When RLS is on and a policy says `auth.uid() = user_id`, Postgres appends that condition to every query against the table, in the executor, below your code. `SELECT * FROM tasks WHERE id = 'someone-elses-uuid'` returns zero rows. Not an error. Zero rows. The row does not exist as far as this connection is concerned.\n\nThe mobile analogy: a `FlatList` whose `data` prop was filtered upstream. The component has no bug and needs no check, because it was never handed the items it should not render. RLS is the filter, upstream of every query you or anyone else will ever write against that table.\n\nTwo halves to a policy. **`USING`** decides which existing rows you can see or touch, so it governs SELECT, UPDATE, and DELETE. **`WITH CHECK`** validates the row you are trying to write, so it governs INSERT and UPDATE. UPDATE needs both: `USING` answers \"may you modify this row\", `WITH CHECK` answers \"is the row you are producing still legal\", which is what stops you from updating your own task and setting `user_id` to someone else.\n\n## In practice\n\nRLS is off by default and policies are ignored until you turn it on.\n\n```sql\nALTER TABLE tasks ENABLE ROW LEVEL SECURITY;\nALTER TABLE categories ENABLE ROW LEVEL SECURITY;\n```\n\nAt this instant the table denies everything to ordinary users, because a table with RLS on and no policies matches no rows. That failure looks exactly like data loss, and it is the number one confusing moment for people new to RLS. Then you grant back precisely what you mean:\n\n```sql\nCREATE POLICY tasks_select_own ON tasks FOR SELECT\n  USING ((select auth.uid()) = user_id);\n\nCREATE POLICY tasks_insert_own ON tasks FOR INSERT\n  WITH CHECK ((select auth.uid()) = user_id);\n\nCREATE POLICY tasks_update_own ON tasks FOR UPDATE\n  USING ((select auth.uid()) = user_id)\n  WITH CHECK ((select auth.uid()) = user_id);\n\nCREATE POLICY tasks_delete_own ON tasks FOR DELETE\n  USING ((select auth.uid()) = user_id);\n```\n\n`auth.uid()` is a function Supabase provides that reads the `sub` claim out of the JWT attached to the current connection. Wrapping it as `(select auth.uid())` is a real performance habit, not noise: it lets Postgres evaluate it once for the statement instead of once per row.\n\nNow the part that most tutorials skip. **A policy only does something if the connection has a user identity.** Your server currently uses the service role key, which bypasses RLS completely, so all four policies above are inert for every query your API makes. To actually run under RLS you build a client per request, carrying the caller's token:\n\n```ts\nexport function userClient(accessToken: string) {\n  return createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY, {\n    global: { headers: { Authorization: `Bearer ${accessToken}` } },\n    auth: { persistSession: false },\n  });\n}\n```\n\nAdd `SUPABASE_ANON_KEY` to your env schema, stash the raw token on `req` in `requireAuth`, and pass a client into your service instead of importing a module-level one. Now `auth.uid()` resolves, the policies apply, and the database is enforcing ownership even on the endpoint you wrote at 11pm.\n\n## In your world\n\nThis is the single most transferable idea in the whole phase, because it is the organizing principle of your work backend. Every request there gets a database handle scoped to the caller, so RLS is live for ordinary request traffic. There is also a privileged handle that bypasses RLS, reserved for background job handlers that legitimately act on many users' data. Using the privileged one inside a request path is treated as a security bug rather than a style problem, and once you have written these four policies you will understand exactly why: it does not produce an error, it produces correct-looking code that silently sees everything.\n\nThe pattern also scales past \"own data\". `chat-app-api` needs membership-based policies (you can read a message if you are a participant in its conversation). `project-tracker-api` needs org-scoped ones (you can read an issue if you belong to its organization). Same mechanism, a more interesting predicate.\n\n## Watch out\n\n- Enabling RLS with no policies denies everything. If your app suddenly returns empty arrays, check that before you check your code.\n- The service role key bypasses RLS. So does the Supabase SQL editor. Neither can be used to test a policy; you need two real accounts and two real access tokens.\n- Policies are per operation. A table with only a SELECT policy silently rejects every insert.\n- An UPDATE policy without `WITH CHECK` lets a user hand their own row to someone else by rewriting `user_id`.\n- Policy predicates run per row, so anything they touch needs an index. A membership check against an unindexed join table turns every query on the table into a nested scan."
+      ,
+      "tasks": [
+        "Add the four policies for `tasks` and four for `categories` in a new migration, then enable RLS on both tables and apply it.",
+        "Immediately after enabling RLS, query the table with a real user token and observe the empty result before any policy exists. Then add the SELECT policy and watch rows appear.",
+        "Add `SUPABASE_ANON_KEY` to `src/config/env.ts`, write the per-request `userClient` helper, and stash the raw bearer token on `req` inside `src/middleware/auth.ts`.",
+        "Switch `src/services/task.service.ts` to accept a Supabase client as its first argument instead of importing the module-level one, and pass the per-request client from the routes.",
+        "Create two real accounts, get two access tokens, and prove with curl that account A gets a 404-shaped empty result for one of B's task ids.",
+        "Try to update one of your own tasks while setting `user_id` to the other account's id, and confirm the `WITH CHECK` half of the UPDATE policy rejects it."
+      ],
+      "quiz": [
+        {
+          "q": "With RLS enabled and an own-data SELECT policy, what does `SELECT * FROM tasks WHERE id = 'another-users-task'` return?",
+          "options": [
+            "A permission denied error",
+            "Zero rows, because the policy is appended to the query and the row does not match",
+            "The row, since RLS only applies to writes",
+            "An empty object with a 403 status"
+          ],
+          "answer": 1,
+          "explain": "RLS is a filter, not a gate. Postgres adds the policy predicate to the query, so a row you may not see simply does not match and is absent from the result. That is what makes it a 404 rather than a 403."
+        },
+        {
+          "q": "What does an UPDATE policy's `WITH CHECK` clause protect against that `USING` alone does not?",
+          "options": [
+            "Updating a row that belongs to another user",
+            "Rewriting your own row so that it now belongs to another user",
+            "Deleting rows you do not own",
+            "Inserting rows without a user_id"
+          ],
+          "answer": 1,
+          "explain": "`USING` is evaluated against the existing row (may you touch it), `WITH CHECK` against the resulting row (is what you produced still legal). Without `WITH CHECK`, a user can update their own task and set `user_id` to somebody else."
+        },
+        {
+          "q": "Your server uses the service_role key and your RLS policies are correct. What protects one user's tasks from another's?",
+          "options": [
+            "The RLS policies, which apply to all connections",
+            "Only your application code, since the service role bypasses RLS entirely",
+            "The JWT signature check in the auth middleware",
+            "Postgres row locks"
+          ],
+          "answer": 1,
+          "explain": "The service role has no row-level restrictions, so the policies are inert for those queries. Ownership is enforced purely by whatever filters your code remembers to apply, which is exactly the fragile situation this module exists to demonstrate."
+        },
+        {
+          "q": "You enable RLS on a table and your app starts returning empty arrays for everything. Most likely cause?",
+          "options": [
+            "The JWT is expired",
+            "No policies exist yet, and a table with RLS enabled and no policies matches no rows",
+            "The table lost its indexes when RLS was enabled",
+            "RLS requires a `WITH CHECK` clause on SELECT"
+          ],
+          "answer": 1,
+          "explain": "Enabling RLS is deny-by-default. Policies grant access back. An empty result rather than an error is the expected and initially confusing behaviour."
+        }
+      ],
+      "resources": [
+        { "label": "PostgreSQL: Row Security Policies", "url": "https://www.postgresql.org/docs/current/ddl-rowsecurity.html" },
+        { "label": "Supabase: Row Level Security", "url": "https://supabase.com/docs/guides/database/postgres/row-level-security" },
+        { "label": "roadmap.sh: API Security Best Practices", "url": "https://roadmap.sh/best-practices/api-security" },
+        { "label": "Supabase: Auth", "url": "https://supabase.com/docs/guides/auth" }
+      ],
+      "trap": {
+        "title": "Forget the WHERE clause on exactly one route",
+        "content": "Do this before you turn RLS on, and do it in this order. The order is the lesson.\n\n**Step 1.** Build all five task endpoints (list, get by id, create, update, delete) the way the project starts out: service role key, and every query manually scoped with `.eq('user_id', userId)`. Test them. They work. Feel how normal and safe this looks.\n\n**Step 2.** Open `src/services/task.service.ts` and delete the `.eq('user_id', userId)` line from `getTaskById` only. Leave the other four intact. Do not change anything else, and do not add a comment. The function still reads perfectly well.\n\n**Step 3.** Create a second account. Create a task in it. Copy that task's id.\n\n**Step 4.** With account A's access token, request `GET /tasks/:id` for account B's task. Read the response body.\n\nYou are authenticated. Your token is valid. The middleware ran and passed. And you are looking at another user's data, returned with a 200.\n\n**Step 5.** Now try the same thing against `PATCH /tasks/:id` and `DELETE /tasks/:id`, which still have their filters. Note that those correctly fail. Four out of five endpoints were right.\n\n**Step 6.** Enable RLS, add the SELECT policy, switch to a per-request client carrying the user's token, and repeat step 4 with the `.eq()` still missing. It returns nothing. The endpoint is still wrong and no longer exploitable.\n\n**Write three sentences** in a file called `TRAP-NOTES.md` in the project root, answering: what did you actually do wrong, why did every test still pass, and what is the difference between a rule you have to remember on every route and a rule that is enforced once for the table.\n\nThe conclusion you should reach: \"always remember the WHERE clause\" is not a security model. It is a habit, habits have exceptions, and the exception is invisible in code review because the correct and incorrect versions differ by an absence. A security model is something that holds when you forget."
+      }
+    },
+    "m2-4": {
+      "content": "## The problem\n\nThe route file is 400 lines. Every handler validates, queries, formats errors, and responds, and three of them contain the same nineteen lines of filter-building with small differences nobody can account for.\n\nThen product asks for a nightly digest email: everything overdue by more than three days, per user, at 6am. And the logic for \"which tasks are overdue\" exists only inside an Express handler that needs a `req` and a `res` to run. So you copy it into the cron script. Six weeks later someone fixes an off-by-one in one of the two copies, and now the email and the app disagree about a number the user can see. That is not a code-quality complaint. It is a support ticket you cannot close.\n\n## The idea\n\nA service is a plain exported function that takes what it needs as arguments and returns data. No `req`, no `res`, no status codes, no knowledge that HTTP exists.\n\nYou already know why this works, from RN. Logic that lives inside a component can only run when that component renders. Pull it into a hook or a plain module function and suddenly it is testable, reusable from three screens, and does not care about the view. A route handler is the same trap with a different shape, and a service is the same escape.\n\nThat gives you the layering rule as a single sentence: **a route translates HTTP into arguments and results into HTTP, and a service does the work.** The test for whether you got it right is the cron job question. If a new caller with no HTTP involved can use your logic by calling one function, you are layered. If it has to fake a `req` object, you are not.\n\n## In practice\n\nThe route is short enough to read in one glance. That is the point of it.\n\n```ts\nrouter.get('/tasks', async (req, res) => {\n  const filters = taskQuerySchema.parse(req.query);\n  const tasks = await taskService.listTasks(req.user!.id, filters);\n  res.json(tasks);\n});\n```\n\nValidate, delegate, respond. Notice `taskQuerySchema.parse` before anything else: query strings arrive as strings, so `is_completed` is `'true'` and `priority` is `'2'`, and `z.coerce` turns them into real types. Anything that fails validation throws a `ZodError` you map to a 400 with field-level details.\n\nThe service builds the query by conditionally chaining, which works because the query builder is immutable and each call returns a new object.\n\n```ts\nexport async function listTasks(db: SupabaseClient, userId: string, filters: TaskQueryInput) {\n  let query = db\n    .from('tasks')\n    .select('*, categories(*)')\n    .eq('user_id', userId);\n\n  if (filters.is_completed !== undefined) query = query.eq('is_completed', filters.is_completed);\n  if (filters.priority !== undefined) query = query.eq('priority', filters.priority);\n  if (filters.category_id !== undefined) query = query.eq('category_id', filters.category_id);\n  if (filters.due_date_from !== undefined) query = query.gte('due_date', filters.due_date_from);\n  if (filters.due_date_to !== undefined) query = query.lte('due_date', filters.due_date_to);\n  if (filters.search !== undefined) query = query.ilike('title', `%${filters.search}%`);\n\n  query = query.order(filters.sort_by, { ascending: filters.sort_order === 'asc' });\n\n  const { data, error } = await query;\n  if (error) throw error;\n  return data;\n}\n```\n\nTaking `db` as the first argument is what makes this callable from a cron job, a worker, or a test with a stub. It is also what let you swap in a per-request client for RLS yesterday.\n\nEvery one of those filters becomes a parameter, not string concatenation. That is the injection story, and it has a subtlety worth understanding rather than trusting. If you ever drop to raw SQL, this is the difference:\n\n```ts\n// Never. `search` is whatever the caller typed.\nawait pool.query(`SELECT * FROM tasks WHERE title ILIKE '%${search}%'`);\n\n// Always. The driver sends the query and the values separately.\nawait pool.query(\n  'SELECT * FROM tasks WHERE user_id = $1 AND title ILIKE $2',\n  [userId, `%${search}%`],\n);\n```\n\nAnd here is the subtlety: **you can parameterize values but not identifiers.** `ORDER BY $1` does not work, because a column name is part of the query's structure, not data. So `sort_by` cannot be parameterized, which means the only safe way to accept it from a client is an allow-list. That is exactly what `sort_by: z.enum(['created_at', 'due_date', 'priority', 'title'])` is doing in your schema: it is not input tidiness, it is the injection defence for that one field.\n\nWhich brings you to the pattern that runs through every remaining phase. **Defense in depth** means two independent mechanisms, chosen so that a failure in one is covered by the other.\n\n| Layer 1 | Layer 2 | What layer 2 catches |\n|---|---|---|\n| Zod on `priority` | `CHECK (priority BETWEEN 0 AND 3)` | A bug in your schema, a bulk script, manual SQL |\n| `requireAuth` middleware | RLS policies | A route mounted above the middleware, a forgotten filter |\n| `.eq('user_id', userId)` | `auth.uid() = user_id` policy | The one endpoint out of fourteen |\n\nRead the right-hand column carefully. Every entry is a mistake a competent person makes on a Tuesday. The second layer exists because the first one is written by a human every time, and the second one is written once.\n\n## In your world\n\nRun the verification checklist before calling this done: env refuses to boot when a variable is missing; a request with no token gets 401; a request for another user's task id returns nothing; `priority = 7` is rejected with a 400 naming the field; `updated_at` moves on a raw SQL update; the due-date-range query uses an index scan under `EXPLAIN ANALYZE`; and every service function can be called with no Express request in scope.\n\nEverything here returns, harder. `chat-app-api` reuses this service shape for cursor pagination; `marketplace-api` reuses the filter builder for ranked full-text search. Your work backend is the same three layers with different libraries: routes validate against a schema and delegate, services are plain exported functions taking a database handle first, and business logic in a route is a review comment. You have now built that from the bottom, which is why reading it will feel like recognition rather than study.\n\n## Watch out\n\n- A service that imports a module-level database client is not testable and cannot be given a per-request identity. Pass the handle in.\n- Do not let a service throw HTTP status codes. It throws domain errors; the route decides they mean 404 or 409.\n- Rethrowing a raw database error to the client leaks table and column names. Map known error codes and log the rest.\n- `ILIKE '%term%'` cannot use a B-tree index, so it scans. Fine at ten thousand rows, not at a million. That is day 22.\n- Filters that are all optional means `GET /tasks` with no params returns everything. Add a `limit` with a default before this table gets big.\n\n## Checkpoint\n\nAnswer these out loud, cold, with the editor closed. If an answer takes more than four sentences you do not have it yet.\n\n1. Open `src/middleware/auth.ts` and point at any three lines. For each one, say precisely what breaks if you delete it, and how you would find out in production.\n2. You have `.eq('user_id', userId)` in every service function AND an RLS policy on the table. Why keep both? Which one fails loudly, which one fails silently, and which one survives a new developer's first pull request?\n3. Product wants the overdue-digest cron job. Which files do you touch, what exactly does the call look like, where does the user id come from with no request in scope, and which database client does it use and why?\n4. `sort_by` arrives in the query string and ends up in `ORDER BY`. Explain why it cannot be a bound parameter, and name the specific thing in your code that makes it safe anyway.\n5. Two different users each create a category named \"Work\". Should that succeed? What in your schema currently decides, and what would you write to enforce the opposite answer?\n6. A user's access token expires while they are mid-scroll in your RN app. Walk the entire path from the 401 through to the retried request, naming what happens on the device and what happens on the server at each step."
+      ,
+      "tasks": [
+        "Refactor `src/services/task.service.ts` so every function takes the Supabase client as its first argument, and update `src/routes/tasks.ts` to pass it in.",
+        "Write `src/schemas/task.schema.ts` with `taskQuerySchema` using `z.coerce` for the boolean and number filters and `z.enum` for `sort_by` and `sort_order`.",
+        "Exercise all six filters plus sort with curl, including two at once, and for each request write down the SQL you believe was generated.",
+        "Send `?sort_by=title;DROP TABLE tasks` and confirm Zod rejects it with a 400 before it reaches the service. Then explain why an allow-list rather than escaping is the right fix here.",
+        "Write a standalone script `scripts/digest.ts` that imports `listTasks` directly, with no Express involved, and prints every task overdue by more than three days. This is the proof your layering is real.",
+        "Run the full verification checklist from the 'In your world' section and fix anything that fails before moving to phase 3.",
+        "Answer all six checkpoint questions out loud without notes. Record yourself if nobody is available to listen."
+      ],
+      "quiz": [
+        {
+          "q": "What is the practical test for whether your logic is genuinely in the service layer?",
+          "options": [
+            "The route handler is under ten lines",
+            "A caller with no HTTP request in scope, such as a cron job, can use the logic by calling one function",
+            "The service file imports no other modules",
+            "The service returns a fully formatted JSON response"
+          ],
+          "answer": 1,
+          "explain": "HTTP-independence is the whole property. If the logic can only run when a `req` and `res` exist, it will be copy-pasted the first time a worker, socket handler, or scheduled job needs it, and the copies will drift."
+        },
+        {
+          "q": "Why can `sort_by` not be passed as a bound parameter like `ORDER BY $1`?",
+          "options": [
+            "Because Postgres does not support parameters in ORDER BY expressions of type text",
+            "Because a column name is part of the query's structure, and parameters can only substitute values",
+            "Because PostgREST strips parameters from ORDER BY clauses",
+            "It can, but the driver requires an explicit cast"
+          ],
+          "answer": 1,
+          "explain": "Parameters are values, not identifiers. Passing a string as `$1` in ORDER BY sorts by that constant string, not by the column. Since you cannot parameterize it, the only safe route is an allow-list, which is what `z.enum` provides."
+        },
+        {
+          "q": "Which pair is a genuine example of defense in depth?",
+          "options": [
+            "Zod validating `priority` and TypeScript typing it as a number",
+            "Zod validating `priority` and a `CHECK (priority BETWEEN 0 AND 3)` constraint on the column",
+            "Two separate Zod schemas validating the same field",
+            "An auth middleware and a second auth middleware on the same router"
+          ],
+          "answer": 1,
+          "explain": "Depth requires independent mechanisms with different failure modes. TypeScript and Zod both live in your application and both disappear when someone runs raw SQL; the CHECK constraint holds regardless of which writer produced the statement."
+        },
+        {
+          "q": "Why should a service throw a domain error rather than sending a 404 itself?",
+          "options": [
+            "Because Express cannot send responses from outside a route handler",
+            "Because status codes are a property of the HTTP transport, and a service that emits them cannot be reused by a job, a socket handler, or a test",
+            "Because 404 is the wrong code for a missing row",
+            "Because throwing is faster than returning a response"
+          ],
+          "answer": 1,
+          "explain": "The service's job is to report what happened in domain terms (not found, conflicting, forbidden). Translating that into a status code is the route's job, which is exactly what keeps the service callable from non-HTTP contexts."
+        }
+      ],
+      "resources": [
+        { "label": "Zod documentation", "url": "https://zod.dev" },
+        { "label": "Express: Routing", "url": "https://expressjs.com/en/guide/routing.html" },
+        { "label": "PostgreSQL: Using EXPLAIN", "url": "https://www.postgresql.org/docs/current/using-explain.html" },
+        { "label": "Supabase: Auto-generated REST API", "url": "https://supabase.com/docs/guides/api" },
+        { "label": "roadmap.sh: Backend", "url": "https://roadmap.sh/backend" }
+      ]
+    }
+  }
+}

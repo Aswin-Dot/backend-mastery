@@ -1,0 +1,653 @@
+{
+  "phaseId": "p3",
+  "modules": {
+    "m3-1": {
+      "content": "## The problem\n\nYour feed screen works. `FlatList`, `onEndReached`, a `page` counter, append to the array. Then QA files a bug with a screenshot: the same post appears twice, about twenty items down. You can't reproduce it. Then you can — but only when someone posts while you're scrolling.\n\nHere is what happened on the server. Page 1 was `OFFSET 0 LIMIT 20` and returned rows 1–20 of \"newest first\". While the user read those twenty, one new post arrived at the top, and every row shifted down by one. Page 2 asked for `OFFSET 20 LIMIT 20` — and the row you already have at position 20 now sits at position 21. It comes back, and you render it twice. A delete shifts things the other way, and then a post silently never appears at all; nobody sees a duplicate that time, they just never see the post.\n\nOffset pagination asks the database for a *position*, and positions aren't stable in a table people are still writing to. The second symptom shows up later, in the logs: at `OFFSET 40000`, Postgres still walks and discards forty thousand rows before handing you twenty. \"Load more\" gets slower the deeper the user scrolls, which is exactly backwards.\n\n## The idea\n\nStop asking for a position. Ask for a place.\n\nOffset is \"start reading at line 500\" — the reader counts 500 lines every time, and if someone inserts a line at the top, line 500 is a different line than it was a minute ago. A cursor is a bookmark: \"start right after *this exact* row.\" Insert a hundred lines above it and the bookmark still points at the same physical row.\n\nThis is **keyset pagination**, usually called cursor pagination. It needs one thing: the sort order must be a *unique* tuple, so \"right after this row\" is unambiguous. `created_at` alone isn't unique — two messages can land in the same microsecond, and then two rows both claim to be the boundary. So you sort by `(created_at, id)`: the timestamp does the ordering humans care about, the id breaks ties.\n\n## In practice\n\n```sql\n-- Page 1: no cursor. Newest first, ordered by a tuple that is unique.\nSELECT id, content, sender_id, created_at\nFROM messages\nWHERE channel_id = $1\nORDER BY created_at DESC, id DESC\nLIMIT 20;\n```\n\nThe client keeps the last row it received. That row's `(created_at, id)` is the cursor.\n\n```sql\n-- Page 2+: \"strictly older than the row I already have\"\nSELECT id, content, sender_id, created_at\nFROM messages\nWHERE channel_id = $1\n  AND (created_at, id) < ($2, $3)\nORDER BY created_at DESC, id DESC\nLIMIT 20;\n```\n\n`(created_at, id) < ($2, $3)` is a **row comparison**, not two separate conditions. Postgres compares left to right: an older timestamp wins outright, an equal timestamp falls through to the id. One comparison, and one index can serve it.\n\n```sql\nCREATE INDEX idx_messages_channel_created\n  ON messages (channel_id, created_at DESC, id DESC);\n```\n\nThree things about that index. `channel_id` comes first because it's the equality filter, and you want one channel's rows sitting together in the sorted structure. `DESC` matches the query's direction, so Postgres reads the index forward instead of walking it backward. And the index tuple matches the `WHERE` tuple, so the seek is O(log n): jump to the cursor, read twenty entries, stop. Same cost on page 2 and page 4000.\n\nThe cursor itself should be **opaque** — one string the client stores and hands back, with no promise about what's inside.\n\n```ts\ninterface Cursor {\n  createdAt: string;\n  id: string;\n}\n\nconst cursorSchema = z.object({\n  createdAt: z.string().datetime(),\n  id: z.string().uuid(),\n});\n\nconst encodeCursor = (c: Cursor) =>\n  Buffer.from(JSON.stringify(c)).toString(\"base64url\");\n```\n\nDecoding is parsing untrusted input, so it goes through zod like any other request field:\n\n```ts\nconst decodeCursor = (raw: string): Cursor => {\n  const json: unknown = JSON.parse(Buffer.from(raw, \"base64url\").toString());\n  return cursorSchema.parse(json); // throws → 400, not a 500 from deep in the query\n};\n```\n\nThe service asks for one row more than it needs. That extra row is how you know there's a next page without a second `COUNT(*)`:\n\n```ts\nexport async function listMessages(channelId: string, limit: number, cursor?: Cursor) {\n  const rows = await fetchPage(channelId, limit + 1, cursor);\n  const hasMore = rows.length > limit;\n  const items = hasMore ? rows.slice(0, limit) : rows;\n  const last = items.at(-1);\n\n  return {\n    items,\n    nextCursor: hasMore && last\n      ? encodeCursor({ createdAt: last.created_at, id: last.id })\n      : null,\n  };\n}\n```\n\nThe response shape, for every paginated endpoint, no exceptions:\n\n```json\n{ \"items\": [], \"nextCursor\": \"eyJjcmVhdGVkQXQiOiIyMDI2LTA4LTEwVDA5OjMwOjAwWiJ9\" }\n```\n\n`nextCursor: null` means \"you're at the end\" and the client stops calling. No `total`, no `page`, no `hasNextPage` derived from arithmetic that can disagree with reality.\n\nOne wrinkle: supabase-js can't express a row comparison. Spell the tuple out, or move the query into a stored function:\n\n```ts\nquery = query.or(\n  `created_at.lt.${c.createdAt},and(created_at.eq.${c.createdAt},id.lt.${c.id})`\n);\n```\n\n## In your world\n\n`chat-app-api`'s `getMessages` in `src/services/message.service.ts` already paginates by cursor — with a timestamp-only cursor and `.lt('created_at', cursor)`. That's the version with the tie bug still in it: two messages written in the same microsecond, and one becomes invisible forever because the page boundary falls between two rows that compare equal. Your first job here is to widen that cursor to `(created_at, id)` and widen the index to match. You can trigger the bug on purpose by sending two messages from a tight loop.\n\nYour work backend's feed is the same shape: append-heavy, read newest-first, scrolled by people who are still receiving new content while they scroll. And the client keeps its half of the bargain — treat `nextCursor` as opaque, never construct one, and still dedupe by `id` when appending. One is the fix, the other is the seatbelt.\n\n## Watch out\n\n- **A non-unique sort silently breaks pagination.** Ties don't raise errors. They drop and repeat rows at a rate low enough to survive QA and high enough to annoy real users.\n- **Direction has to be consistent.** `ORDER BY created_at DESC, id ASC` cannot be served by one index scan on `(created_at DESC, id DESC)`. Postgres sorts in memory instead and you wonder why the fast query is slow.\n- **Base64 is not encryption.** An opaque cursor buys you the freedom to change its contents later; it hides nothing. Never put an authorization-relevant value in it, and always re-check access on the rows you return.\n- **Cursors and page numbers don't mix.** You cannot jump to page 7 with a keyset. If a screen genuinely needs numbered pages, offset is the right tool — just cap how deep it can go.",
+      "tasks": [
+        "Reproduce the bug: seed 60 messages, fetch page 1 with OFFSET 0 LIMIT 20, insert one new message, then fetch OFFSET 20 LIMIT 20 and name the row that appears in both pages.",
+        "Rewrite getMessages in chat-app-api to use a (created_at, id) tuple cursor, and add a migration that widens idx_messages_channel_created to (channel_id, created_at DESC, id DESC).",
+        "Add encodeCursor and decodeCursor helpers with a zod schema on the decode path, then send a tampered cursor and confirm the API returns 400, not 500.",
+        "Fetch limit + 1 rows and return { items, nextCursor }; assert nextCursor is null on the final page and non-null on every other page.",
+        "Insert two messages inside a tight loop so they share a timestamp, then page through with a timestamp-only cursor and prove one message is unreachable.",
+        "Run EXPLAIN ANALYZE on the offset query at OFFSET 40000 and on the keyset equivalent; write down rows-scanned and timing for both."
+      ],
+      "quiz": [
+        {
+          "q": "An infinite-scroll feed backed by OFFSET pagination shows the same post twice. What is the actual cause?",
+          "options": [
+            "The client appends results without deduplicating by id",
+            "Rows shift position when new rows are inserted, so the next OFFSET window overlaps the previous page",
+            "Postgres returns rows in non-deterministic order when there is no primary key",
+            "The connection pool returned a cached result set"
+          ],
+          "answer": 1,
+          "explain": "OFFSET addresses a position in the result set. An insert above the window pushes every row down one, so the row at the page boundary lands inside the next page too. Client-side dedupe hides the symptom without fixing the pagination."
+        },
+        {
+          "q": "Why does the cursor carry id alongside created_at?",
+          "options": [
+            "So the client can sort locally",
+            "Because created_at is not indexed on its own",
+            "Because two rows can share a created_at, and a non-unique boundary silently drops or repeats rows",
+            "Because UUIDs happen to sort chronologically"
+          ],
+          "answer": 2,
+          "explain": "Keyset pagination needs an unambiguous 'the row after this one'. If two rows compare equal on the sort key, the boundary is undefined and rows fall through the crack with no error."
+        },
+        {
+          "q": "What does DESC buy you in the index (channel_id, created_at DESC, id DESC)?",
+          "options": [
+            "A physically smaller index",
+            "Postgres can read the index forward for a newest-first query instead of walking it backward",
+            "Faster inserts, because new rows land at the end",
+            "It forces an index-only scan"
+          ],
+          "answer": 1,
+          "explain": "B-tree indexes are ordered. Matching the index direction to the query's ORDER BY lets Postgres scan forward, which is measurably cheaper than a backward scan at scale."
+        },
+        {
+          "q": "When is OFFSET still the right tool?",
+          "options": [
+            "A chat message list",
+            "An admin table over mostly-static data that genuinely needs numbered pages",
+            "Any activity feed with live inserts",
+            "Any endpoint the mobile app calls"
+          ],
+          "answer": 1,
+          "explain": "Keysets cannot jump to page 7. When numbered pages are a real product requirement and the data is not being written under the reader, offset is fine — just cap how deep it can go."
+        },
+        {
+          "q": "The API returns nextCursor: null. What should the client do?",
+          "options": [
+            "Stop requesting; it has reached the end of the list",
+            "Retry with the previous cursor",
+            "Fall back to offset pagination",
+            "Re-request the first page to refresh"
+          ],
+          "answer": 0,
+          "explain": "A null nextCursor is the end-of-list signal. That is the whole contract, which is why you don't also need a total count or a hasNextPage flag that could disagree with it."
+        }
+      ],
+      "resources": [
+        {
+          "label": "PostgreSQL: LIMIT and OFFSET",
+          "url": "https://www.postgresql.org/docs/current/queries-limit.html"
+        },
+        {
+          "label": "PostgreSQL: Row and array comparisons",
+          "url": "https://www.postgresql.org/docs/current/functions-comparisons.html"
+        },
+        {
+          "label": "PostgreSQL: Indexes and ORDER BY",
+          "url": "https://www.postgresql.org/docs/current/indexes-ordering.html"
+        },
+        {
+          "label": "roadmap.sh: API design",
+          "url": "https://roadmap.sh/api-design"
+        }
+      ]
+    },
+    "m3-2": {
+      "content": "## The problem\n\nYou've built the chat screen twice. The first version polled: `GET /channels/:id/messages?cursor=…` on a two-second `setInterval`. It was fine on the simulator. On a real phone, three things went wrong at once. Battery — the radio woke up thirty times a minute to be told nothing had changed. Latency — a message still took up to two seconds to appear, and \"up to two seconds\" reads as \"this app is slow\" when you're texting someone across the table. And cost — ten thousand users polling every two seconds is five thousand requests per second of mostly-empty JSON, whether or not anyone is talking.\n\nThe second version opened a socket, and the message appeared before your thumb left the send button. Same database, same query, same server. What changed was who initiates.\n\n## The idea\n\nHTTP is a walkie-talkie. You press the button, you get a reply, the channel closes. To find out whether anything changed, you press it again — that's polling, and every press costs a round trip plus headers to hear \"nothing new.\"\n\nA WebSocket is a phone call you leave open. One handshake, then either side speaks whenever it has something to say, in frames only a few bytes larger than the payload. The server can now *initiate*, which is the entire point: nobody has to ask.\n\nThe handshake is ordinary HTTP, exactly once:\n\n```text\nGET /ws HTTP/1.1\nHost: api.example.com\nConnection: Upgrade\nUpgrade: websocket\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\n```\n\n```text\nHTTP/1.1 101 Switching Protocols\nUpgrade: websocket\nConnection: Upgrade\n```\n\n`101` is the interesting status code. The TCP connection isn't closed and reopened — it *stops being HTTP* and starts carrying WebSocket frames.\n\n| | Polling | SSE | WebSocket |\n|---|---|---|---|\n| Who initiates | Client, repeatedly | Server, after one subscribe | Either side, any time |\n| Direction | Request/response | Server to client only | Full duplex |\n| Transport | A new request each time | One long-lived HTTP response | An upgraded TCP connection |\n| Good for | Slow-changing data, simple infra | Notifications, live counters | Chat, presence, typing |\n| Cost | Wasted requests | Cheap, one-way | A connection you must now manage |\n\nReach for SSE more often than you'd expect: if the client never needs to push, it's just an HTTP response that stays open, and every proxy already understands it. Reach for WebSocket when the client also talks — typing events, join and leave, live cursors.\n\n## In practice\n\nThe socket server shares the Express server, so it shares the port.\n\n```ts\nconst server = createServer(app); // not app.listen()\nconst wss = new WebSocketServer({ server, path: \"/ws\" });\nserver.listen(env.PORT);\n```\n\nRequests to `/channels` go to Express; an upgrade request to `/ws` goes to `wss`. One process, one port, one load balancer target.\n\nAuth: the browser's WebSocket API can't set an `Authorization` header, so the token rides in the query string — and you verify it before registering anything.\n\n```ts\nconst token = new URL(url, \"http://localhost\").searchParams.get(\"token\");\nconst { data, error } = await supabase.auth.getUser(token);\nif (error || !data.user) {\n  ws.close(4001, \"Invalid or expired token\");\n  return;\n}\n```\n\nUse `wss://` in production. The query string is inside TLS, but it can still land in access logs, so keep these tokens short-lived.\n\nThere's no method and no path inside a socket, so you invent both. A `type` field is the convention:\n\n\n```ts\n// client → server\n{ type: \"join_channel\", channel_id: \"…\" }\n{ type: \"start_typing\", channel_id: \"…\" }\n\n// server → client\n{ type: \"new_message\", message: { } }\n{ type: \"presence\", user_id: \"…\", status: \"online\" }\n```\n\nNow the architectural rule, and it's the one to memorize: **write over REST, receive over WS.** The client POSTs a message and waits for a 201. It does not send messages up the socket. Why: the POST path gives you the whole stack you already trust — auth middleware, zod validation, rate limiting, a transaction, and an error you can actually return. And the committed row is the fact. The socket only announces facts that already exist.\n\nSupabase Realtime closes the loop without your write path knowing anything about it:\n\n```sql\nALTER PUBLICATION supabase_realtime ADD TABLE messages;\n```\n\nThat line tells Postgres to stream changes on `messages` out through logical replication — the same write-ahead log the database already uses to keep replicas honest. Supabase's Realtime service decodes the WAL and hands you change events:\n\n```ts\nsupabase\n  .channel(\"messages-global\")\n  .on(\n    \"postgres_changes\",\n    { event: \"INSERT\", schema: \"public\", table: \"messages\" },\n    (payload) => {\n      const row = payload.new;\n      broadcastToChannel(row.channel_id, { type: \"new_message\", message: row });\n    },\n  )\n  .subscribe();\n```\n\nOne subscription for the whole table, then fan out server-side using a map from channel id to the sockets watching it. Not one per channel: a thousand active channels would mean a thousand subscriptions against a service with limits, to learn the same thing you can learn once.\n\nSay the path out loud: POST, INSERT, WAL, Realtime, your callback, look up subscribers, `ws.send()`, the other phone re-renders. Nothing in that chain trusts the socket with data the database hasn't already committed.\n\n### Reconnection\n\nA socket is a hope, not a guarantee. Phones move from Wi-Fi to LTE mid-sentence, go through tunnels, get backgrounded. When the socket drops, events that happened during the gap are gone — Realtime does not replay them.\n\nSo the reconnect handler is more than \"open the socket again\":\n\n```ts\nsocket.onopen = async () => {\n  const { items } = await api.get(`/channels/${id}/messages`, {\n    params: { cursor: lastSeenCursor }, // the cursor from the previous module\n  });\n  merge(items);\n};\n```\n\nThat's why cursor pagination came first. Fetch-since-cursor is the only correct way to close the gap, and it works precisely because the database — not the socket — is the source of truth.\n\n## In your world\n\n`chat-app-api`'s `src/services/realtime.service.ts` is this whole module in one file: `initializeWebSocket`, the clients map, the channel-to-sockets inverted index, and one global `postgres_changes` subscription. Read it top to bottom and mark every place a decision from this module shows up. Then break it deliberately: in a scratch database, skip the `ALTER PUBLICATION` line and watch POST keep returning 201 while the other client goes silent. Feeling that the write path and the notify path are independent is worth more than reading it.\n\nYour work backend does the same split, and you've already lived on the client end of it: the app receives a small event, then it *fetches*. Now you know why the event is small and the fetch is authoritative.\n\n## Watch out\n\n- **Never let the socket be the only path.** If a message exists only because a frame was delivered, you've built a system with no recovery. Write it, then announce it.\n- **Don't broadcast raw database rows.** `payload.new` is whatever the table holds, including the column you added last week for internal bookkeeping. Map it into a response shape on purpose.\n- **Proxies kill idle connections.** Load balancers commonly cut a socket after sixty seconds of silence. Send pings, and reconnect with backoff rather than in a tight loop.\n- **Two API instances break in-memory routing.** With Realtime as the bus, both instances receive the event, so fan-out still works. But anything you kept in a local map — who's online, who's typing — is per-instance. That's the next module.",
+      "tasks": [
+        "Read src/services/realtime.service.ts end to end, then draw the path from POST to the other device's re-render, naming every hop including the WAL.",
+        "Connect two wscat clients with valid tokens, join the same channel, POST a message with curl, and confirm both sockets receive it without either one polling.",
+        "In a scratch database, skip ALTER PUBLICATION supabase_realtime ADD TABLE messages and confirm POST still returns 201 while no socket event arrives.",
+        "Drop one client's connection for 30 seconds, POST from the other, reconnect, and prove the missed message only appears after a fetch-since-cursor.",
+        "Add a ping/pong heartbeat plus client reconnect with exponential backoff, and verify a 60-second idle connection survives.",
+        "Map payload.new into an explicit response shape before broadcasting instead of forwarding the raw row, and note which columns you chose to withhold."
+      ],
+      "quiz": [
+        {
+          "q": "Which HTTP status code completes a WebSocket handshake?",
+          "options": [
+            "200 OK",
+            "101 Switching Protocols",
+            "204 No Content",
+            "426 Upgrade Required"
+          ],
+          "answer": 1,
+          "explain": "The client sends an ordinary GET with Connection: Upgrade, and the server answers 101. The TCP connection is not reopened — it stops speaking HTTP and starts carrying WebSocket frames."
+        },
+        {
+          "q": "Why write over REST and only receive over WebSocket, rather than sending messages up the socket?",
+          "options": [
+            "WebSocket frames cannot carry JSON",
+            "The POST path gives you auth, validation, rate limiting, transactions and a real error response, and the committed row is the fact the socket merely announces",
+            "Supabase Realtime cannot observe writes made over a socket",
+            "Sockets are slower than HTTP for writes"
+          ],
+          "answer": 1,
+          "explain": "The socket has no middleware stack and no way to return a structured error. Keeping writes on REST means the database stays the source of truth and the socket is only a notification channel."
+        },
+        {
+          "q": "Why does the client still need a fetch-since-cursor when a socket reconnects?",
+          "options": [
+            "To refresh the auth token",
+            "Because events that occurred while the socket was down are never replayed, so the gap can only be closed from the database",
+            "Because Realtime replays missed events, so this is just belt-and-braces",
+            "To re-register presence"
+          ],
+          "answer": 1,
+          "explain": "Realtime is a live stream, not a log you can rewind. Anything that happened during the disconnect is gone from the socket's perspective and has to be read from Postgres."
+        },
+        {
+          "q": "When is SSE the better choice than a WebSocket?",
+          "options": [
+            "When the client needs to push typing events upstream",
+            "When only the server pushes — notifications, counters — and you want plain HTTP semantics every proxy understands",
+            "When you need to send binary frames",
+            "When you run more than one server instance"
+          ],
+          "answer": 1,
+          "explain": "SSE is a long-lived HTTP response. If the client never needs to talk back, it gives you server push with none of the upgrade, framing, or proxy-compatibility work."
+        },
+        {
+          "q": "Why one global postgres_changes subscription with server-side fan-out instead of one subscription per channel?",
+          "options": [
+            "Per-channel subscriptions cannot filter by event type",
+            "Subscription count would scale with active channels and hit service limits, while fan-out from one subscription keeps it at one",
+            "Global subscriptions are more secure",
+            "Postgres supports only one publication per database"
+          ],
+          "answer": 1,
+          "explain": "A thousand active channels would mean a thousand subscriptions. One subscription plus a channel-to-sockets map delivers the same events with constant subscription cost."
+        }
+      ],
+      "resources": [
+        {
+          "label": "MDN: The WebSocket API",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API"
+        },
+        {
+          "label": "MDN: Server-sent events",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events"
+        },
+        {
+          "label": "Supabase Realtime",
+          "url": "https://supabase.com/docs/guides/realtime"
+        },
+        {
+          "label": "PostgreSQL: Logical replication",
+          "url": "https://www.postgresql.org/docs/current/logical-replication.html"
+        }
+      ]
+    },
+    "m3-3": {
+      "content": "## The problem\n\nThe green dot lies, and you've been on the receiving end of both ways it lies.\n\nOne: you have the app open on your phone and a tab open on your laptop. You close the tab. Your teammates watch you go offline while you're still holding the phone, mid-conversation. Two: the server restarts during a Tuesday deploy, and everyone who was online is now online forever — the `users.is_online` column still says `true`, and nothing will ever set it back, because the process that would have done it no longer exists.\n\nThird symptom, same root cause: \"Aswin is typing…\" pinned under a conversation for six hours. All three come from storing momentary, derived state as if it were a durable fact.\n\n## The idea\n\nTwo kinds of state.\n\n**Facts.** A message was sent. Someone said something at a time, that's still true tomorrow, and you can be asked about it in a support ticket. Facts go to Postgres.\n\n**Weather.** Aswin is online. Aswin is typing. True for a few seconds, meaningless afterwards, and *derived* from something else — whether a socket is open right now. Weather lives in memory and should evaporate when the process does.\n\n`is_online boolean` is a fact-shaped hole you pour weather into. It fails for exactly the reason a `useState` mirror of a prop fails in React: two sources for one truth, drifting the moment something unusual happens — a second device, a crash, a tunnel. The React fix is to derive instead of copy, and the fix here is identical: online is *computed* from live connections, never written down.\n\n## In practice\n\nOnline, as a reference count instead of a boolean. Keyed by user, values are the sets of that user's live sockets:\n\n```ts\n// userId → the set of sockets this user currently has open.\n// Two devices means two entries and one person.\nconst onlineUsers = new Map();\n\nexport function userConnected(userId: string, ws: WebSocket) {\n  if (!onlineUsers.has(userId)) {\n    onlineUsers.set(userId, new Set());\n    broadcastPresence(userId, \"online\"); // first connection only\n  }\n  onlineUsers.get(userId).add(ws);\n}\n\nexport function userDisconnected(userId: string, ws: WebSocket) {\n  const sockets = onlineUsers.get(userId);\n  if (!sockets) return;\n\n  sockets.delete(ws);\n  if (sockets.size === 0) {\n    // last connection only\n    onlineUsers.delete(userId);\n    clearTypingFor(userId);\n    broadcastPresence(userId, \"offline\");\n  }\n}\n```\n\nRead that twice. Both broadcasts sit inside a condition, and those two conditions *are* the feature: announce on the first connect and the last disconnect, nothing in between. Delete the `size === 0` check and closing a laptop tab marks you offline on your phone — the opening bug, in one line.\n\nTyping, with a TTL. The state is a timer, not a flag:\n\n```ts\nconst TYPING_TTL_MS = 3000;\n\n// channelId → (userId → the timer that will clear them)\nconst typingByChannel = new Map();\n\nexport function startTyping(userId: string, channelId: string) {\n  const inChannel = typingByChannel.get(channelId) ?? new Map();\n  typingByChannel.set(channelId, inChannel);\n\n  const existing = inChannel.get(userId);\n  if (existing) clearTimeout(existing);\n  else broadcast(channelId, { type: \"user_typing\", user_id: userId });\n\n  inChannel.set(\n    userId,\n    setTimeout(() => {\n      inChannel.delete(userId);\n      broadcast(channelId, { type: \"user_stop_typing\", user_id: userId });\n    }, TYPING_TTL_MS),\n  );\n}\n```\n\nTwo design choices worth naming. The client **debounces** — it sends `start_typing` at most once a second, because a fast typist otherwise generates ten events a second for a UI that needs one. And the server relies on a **TTL**, not an explicit stop. Users don't stop typing; they trail off, background the app, or lose signal. A `stop_typing` frame that never arrives leaves the indicator stuck forever; a timer makes the worst case a three-second-late clear.\n\nNow rate limits, because you've just built something with no cost per message. A script with a valid token and a `while` loop can push a thousand `POST /messages` per second: a thousand rows written, a thousand events fanned out, a thousand frames delivered to every client in the channel. One user, everyone's app janking.\n\n**Token bucket.** Each user gets a bucket of capacity N, each request costs one token, tokens refill at R per second, and an empty bucket means 429:\n\n```ts\ninterface Bucket {\n  tokens: number;\n  lastRefill: number;\n}\n\nconst buckets = new Map();\n\nexport const rateLimit =\n  (capacity: number, refillPerSec: number) => (req, res, next) => {\n    const key = req.user?.id; // user id, not IP\n    if (!key) return next();\n\n    const now = Date.now();\n    const b = buckets.get(key) ?? { tokens: capacity, lastRefill: now };\n    const elapsedSec = (now - b.lastRefill) / 1000;\n    b.tokens = Math.min(capacity, b.tokens + elapsedSec * refillPerSec);\n    b.lastRefill = now;\n\n    if (b.tokens < 1) {\n      const retryAfter = Math.ceil((1 - b.tokens) / refillPerSec);\n      res.setHeader(\"Retry-After\", retryAfter);\n      return res\n        .status(429)\n        .json({ error: \"Too many requests\", retry_after: retryAfter });\n    }\n\n    b.tokens -= 1;\n    buckets.set(key, b);\n    next();\n  };\n```\n\nWhy a bucket and not a counter? \"Sixty per minute\" lets someone fire sixty messages in the first second and then blocks them for fifty-nine — spiky for the server, baffling for the user. Capacity 20 with a refill of 2 per second lets a real person catch up in a fast conversation while holding the long-run average at two per second. Burst *and* ceiling, in two numbers.\n\nWhere the bucket lives is a real decision. In memory it's a `Map` and zero infrastructure — and it resets on every deploy, and with three instances behind a load balancer each user gets three buckets, so your \"20 per second\" is really 60. Redis makes it shared and restart-proof, at the cost of a network hop per request. Start in memory; know exactly what you traded.\n\n## In your world\n\n`chat-app-api` has all of this: `src/services/presence.service.ts` holds the two maps, and `src/middleware/rate-limiter.ts` holds the bucket plus a cleanup interval that evicts idle users. Read that interval and work out what happens without it after a month of traffic — every user who ever sent one message, still resident.\n\nThen apply it where it counts. Your own standards say auth endpoints get rate limits, and this is why: login and password reset are where an attacker's cost matters most. Note the awkward part — a login has no `req.user` yet, so you're keying on IP plus the submitted identifier, with all the shared-NAT unfairness that implies. Presence escalates the same way: your social app's \"active now\" is this reference-count problem at a scale where in-memory stops working, which is where Redis pub/sub or Supabase's CRDT-based Presence earns its place.\n\n## Watch out\n\n- **A boolean column cannot represent multiple devices.** If you must persist something, persist a `last_seen_at` timestamp you overwrite — and still treat \"online\" as derived from live connections.\n- **Clear typing state on disconnect.** A user who drops mid-word otherwise leaves a timer firing into a channel they've left, or an indicator that never clears. Call it from the last-disconnect branch, not only from `stop_typing`.\n- **Key limits on user id once you have an authenticated user.** An office or a mobile carrier NAT shares one IP across hundreds of people.\n- **Every map in this module is a potential leak.** Socket sets shrink on disconnect, timers clear themselves, buckets need a sweeper. Write the eviction story at the same time as the feature.\n- **A deploy is a free-limit window.** In-memory buckets reset to full. If that matters for the endpoint — and for auth it does — the bucket belongs in Redis.",
+      "tasks": [
+        "Replace any boolean online flag with a map of userId to a set of sockets, and broadcast only on the first connect and the last disconnect.",
+        "Open two wscat connections as the same user, close one, and confirm no offline event is broadcast; close the second and confirm exactly one is.",
+        "Implement the typing TTL, then kill a client mid-typing and confirm the indicator clears within the TTL instead of sticking.",
+        "Add the token-bucket middleware to the send-message route with capacity 20 and refill 2/s, hammer it in a loop, and confirm a 429 with a Retry-After header.",
+        "Restart the server and show that in-memory buckets reset to full; write down what you would change to run three instances safely.",
+        "Read the bucket cleanup interval in chat-app-api and estimate how much memory the map would hold after a month without it."
+      ],
+      "quiz": [
+        {
+          "q": "Why is a users.is_online boolean column the wrong model?",
+          "options": [
+            "Booleans cannot be indexed in Postgres",
+            "It cannot represent multiple simultaneous connections, and nothing resets it when the process dies",
+            "Writing it on every connect is too slow",
+            "Row-level security cannot protect a boolean"
+          ],
+          "answer": 1,
+          "explain": "Online is derived from live sockets. Storing it as a fact creates a second source of truth that drifts on a second device, a crash, or a deploy."
+        },
+        {
+          "q": "A user is connected on phone and laptop. The laptop tab closes. What should the server broadcast?",
+          "options": [
+            "Nothing — the user still has a live connection and stays online",
+            "An offline event, then an online event when the phone next sends anything",
+            "An offline event, because one connection closed",
+            "A presence event with a connection count"
+          ],
+          "answer": 0,
+          "explain": "Presence is a reference count. Offline is broadcast only when the set of that user's sockets becomes empty."
+        },
+        {
+          "q": "Why does the typing indicator rely on a TTL instead of an explicit stop message?",
+          "options": [
+            "Because a stop message is bigger on the wire",
+            "Because users do not explicitly stop typing, and a stop frame that never arrives leaves the indicator stuck forever",
+            "Because timers are cheaper than broadcasts",
+            "Because the client cannot detect blur events"
+          ],
+          "answer": 1,
+          "explain": "People trail off, background the app, or lose signal. A TTL bounds the worst case at a slightly late clear rather than a permanent lie."
+        },
+        {
+          "q": "Token bucket versus a fixed 'N per minute' counter — what does the bucket give you?",
+          "options": [
+            "Lower memory usage",
+            "A bounded burst for real usage while still holding a long-run average rate",
+            "Protection against distributed attacks",
+            "Per-endpoint limits instead of per-user limits"
+          ],
+          "answer": 1,
+          "explain": "A counter permits the entire allowance in the first second and then blocks. Capacity plus refill rate expresses burst and ceiling as two independent numbers."
+        },
+        {
+          "q": "You run three API instances with in-memory buckets and a limit of 20 requests per second per user. What is the effective limit?",
+          "options": [
+            "20 per second, the load balancer keeps a user on one instance",
+            "About 60 per second, because each instance keeps its own bucket",
+            "7 per second, because the limit is divided",
+            "Unlimited, because the buckets never sync"
+          ],
+          "answer": 1,
+          "explain": "Local state means one bucket per instance per user. Shared limits need shared storage — that is the moment Redis stops being optional."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Supabase Realtime: Presence",
+          "url": "https://supabase.com/docs/guides/realtime/presence"
+        },
+        {
+          "label": "Redis documentation",
+          "url": "https://redis.io/docs/latest/"
+        },
+        {
+          "label": "MDN: HTTP",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP"
+        },
+        {
+          "label": "roadmap.sh: API security best practices",
+          "url": "https://roadmap.sh/best-practices/api-security"
+        }
+      ]
+    },
+    "m3-4": {
+      "content": "## The problem\n\n`POST /files/upload` takes eight seconds. You know exactly why: it accepts the bytes, uploads them to storage, resizes the image to three sizes with sharp, writes an activity-log row, recomputes the user's storage total, and *then* returns 201. The mobile client has a ten-second timeout, the user is on hotel Wi-Fi, and the request dies at 99%. They tap upload again. Now there are two files, two thumbnails, and a ticket that says \"it uploaded twice.\"\n\nThe resize was never the user's problem. Nobody is waiting to look at a thumbnail — they're waiting to see their file appear in the list. You spent eight seconds of *their* attention on work that could have happened after they walked away.\n\n## The idea\n\nEverything inside a request handler is work the user pays for in latency. Three kinds don't belong there:\n\n- **Slow work** — image resizing, PDF text extraction, video transcoding, a fifty-thousand-row export.\n- **Unreliable work** — anything that calls someone else's API. Push notifications, email, a payment provider. When they're down, your endpoint should not be down.\n- **Non-critical work** — activity logs, analytics, cache warming, recomputing an aggregate. Valuable, but not what the user asked for.\n\nA queue is the ticket rail in a restaurant kitchen. The waiter (your route handler) writes a ticket, clips it to the rail, and is back on the floor in a second. The cooks (workers) pull tickets off at their own pace. The rail is the durable part: if a cook walks out mid-shift, the tickets are still hanging there.\n\nRedis is the rail. BullMQ is the clipboard and the rules — job records, attempt counts, delays, which queue a ticket belongs to. And here's the part that trips up everyone arriving from app code: **the worker is a separate process.** Not a callback. Not a function you `await`. A second `node` process, started with its own command, that connects to the same Redis and pulls tickets. Your API process never executes a job.\n\n## In practice\n\nProducer side. Define the queue once, with its retry policy:\n\n```ts\nexport const thumbnailQueue = new Queue(\"thumbnail\", {\n  connection: redis,\n  defaultJobOptions: {\n    attempts: 3,\n    backoff: { type: \"exponential\", delay: 5000 }, // 5s, 25s, 125s\n    removeOnComplete: { count: 100 },\n    removeOnFail: { count: 500 },\n  },\n});\n```\n\nThen, in the route, after the file is safely stored:\n\n```ts\nawait thumbnailQueue.add(\"generate\", {\n  fileId: file.id,\n  storagePath: file.storage_path,\n  mimeType: file.mime_type,\n});\n\nres.status(201).json(file); // ~200ms, not 8s\n```\n\n`add()` writes a small JSON record to Redis and returns. Pass ids, never payloads — a 40 MB image inside a job is a 40 MB write to Redis and a 40 MB read on every retry.\n\nConsumer side, in a file the API never imports:\n\n```ts\n// src/jobs/worker.ts — its own entrypoint\nconst thumbnailWorker = new Worker(\"thumbnail\", handleThumbnail, {\n  connection: redis,\n  concurrency: 2, // resizing is CPU-bound\n});\n\nthumbnailWorker.on(\"failed\", (job, err) => {\n  logger.error(\n    { jobId: job?.id, attempts: job?.attemptsMade, err },\n    \"thumbnail job failed\",\n  );\n});\n```\n\nThe job payload is external input, exactly like a request body — it was written by a different process, possibly running an older deploy:\n\n```ts\nasync function handleThumbnail(job) {\n  const data = thumbnailJobSchema.parse(job.data);\n\n  const original = await downloadFromStorage(data.storagePath);\n  const thumb = await sharp(original)\n    .resize(300, 300, { fit: \"inside\", withoutEnlargement: true })\n    .jpeg({ quality: 80 })\n    .toBuffer();\n\n  const thumbPath = thumbPathFor(data.storagePath);\n  await uploadToStorage(thumbPath, thumb, { upsert: true });\n  await recordThumbnail(data.fileId, thumbPath);\n}\n```\n\nTwo processes means two commands, and that's the whole shape of the deployment:\n\n```json\n{\n  \"scripts\": {\n    \"dev:api\": \"tsx watch src/server.ts\",\n    \"dev:worker\": \"tsx watch src/jobs/worker.ts\"\n  }\n}\n```\n\n**Retries mean handlers run more than once.** `attempts: 3`, plus the case where a worker dies after doing the work but before acking it, gives you at-least-once delivery. Not exactly-once. That's harmless for the thumbnail above: it writes the same path and sets the same metadata, so running it five times produces one thumbnail. It is not harmless for \"send the welcome email,\" which is why idempotency is the handler's job and never the queue's:\n\n```ts\n// A unique constraint is the cheapest idempotency you will ever write.\nconst claimed = await claimNotification(job.data.userId, \"welcome_email\");\nif (!claimed) return; // someone already sent it — succeed, do nothing\nawait sendEmail(job.data.userId);\n```\n\nExponential backoff exists because the common failure is temporary: storage was briefly overloaded, the push provider throttled you. Retrying instantly piles load onto the thing already struggling; 5s, 25s, 125s gives it room. After the final attempt the job lands in the failed set — your dead-letter queue — where it waits with its error and stack trace until you look. `removeOnFail: { count: 500 }` is what makes \"until you look\" affordable.\n\n## In your world\n\n`file-vault-api` has three queues in `src/jobs/queues.ts` and their handlers in `src/jobs/workers.ts` — thumbnails, activity log, storage-usage refresh. There, `server.ts` imports the workers, which is the dev-convenience shape: one process doing both jobs. Split it properly — a `src/jobs/worker.ts` entrypoint, a `dev:worker` script, and a `server.ts` that imports nothing from `jobs/workers`. Then run the API with the worker stopped and pay attention to what your API *doesn't* tell you.\n\nYour work backend is the same idea with a different library: pg-boss, with the queue in Postgres rather than Redis, and two separate boss instances for two classes of work. When you reach that codebase, the failure you're about to create by hand is the one that actually bites there — a job enqueued in the wrong place runs on nobody's worker and reports no error at all.\n\n## Watch out\n\n- **`await queue.add()` can fail.** If Redis is unreachable, so is your enqueue. Decide deliberately whether that should fail the request (thumbnail: no, log and move on) or not (a payment capture: yes, and don't return 201).\n- **Payloads must be small and JSON-serializable.** Ids and paths. Not buffers, not class instances, not a `Date` you expect to arrive back as a `Date`.\n- **Handlers have privileged credentials and no request context.** There is no logged-in user inside a job. Every authorization decision must be re-derived from the payload, and the payload must be validated.\n- **Concurrency is a CPU budget.** `concurrency: 20` on a sharp worker will use every core and make the box unresponsive. Two to four for image work; much higher for I/O-bound jobs.\n- **Nothing above tells you a queue is backing up.** Queue depth is a number you have to go and fetch on purpose. That's the trap below, and it's the whole reason the trap exists.",
+      "tasks": [
+        "Move thumbnail generation out of the upload route into a job, and record the endpoint's response time before and after.",
+        "Split the worker into its own entrypoint src/jobs/worker.ts with a dev:worker script, and remove the workers import from server.ts.",
+        "Configure attempts: 3 with exponential backoff, make the handler throw on purpose, and write down the actual retry timestamps you observe.",
+        "Validate job.data with a zod schema at the top of every handler, then enqueue a malformed payload and confirm the job fails without killing the worker.",
+        "Write an idempotent handler for a notification job using a unique constraint as the dedupe key, and run the same job twice to prove one send.",
+        "Add an authenticated queue-depth endpoint returning waiting, active and failed counts for all three queues.",
+        "Do both halves of the trap below and write one sentence on how you would have detected each in production."
+      ],
+      "quiz": [
+        {
+          "q": "Which of these belongs inside the request path?",
+          "options": [
+            "Resizing the uploaded image into three sizes",
+            "Writing the database row the user asked you to create",
+            "Sending the push notification to the recipient's device",
+            "Recomputing the account's aggregate storage total"
+          ],
+          "answer": 1,
+          "explain": "The user is waiting for the thing they asked for. Slow work, third-party calls, and derived aggregates all belong on the other side of a queue."
+        },
+        {
+          "q": "BullMQ retries give you at-least-once delivery. What does that require of your handlers?",
+          "options": [
+            "They must complete within the visibility timeout",
+            "They must be idempotent, so running the same job twice has the same effect as running it once",
+            "They must never throw",
+            "They must run with concurrency 1"
+          ],
+          "answer": 1,
+          "explain": "A worker can die after doing the work but before acking it. Overwriting the same thumbnail path is naturally safe; sending an email is not, so the handler needs its own dedupe key."
+        },
+        {
+          "q": "Why exponential backoff rather than retrying immediately?",
+          "options": [
+            "It reduces Redis memory usage",
+            "Failures are usually temporary, and instant retries pile more load onto the thing that is already struggling",
+            "BullMQ requires a delay between attempts",
+            "It guarantees the job eventually succeeds"
+          ],
+          "answer": 1,
+          "explain": "5s, 25s, 125s gives an overloaded dependency room to recover. A tight retry loop turns a brief outage into a sustained one."
+        },
+        {
+          "q": "You enqueue to a queue name no worker was constructed for. What happens?",
+          "options": [
+            "add() rejects and the request returns 500",
+            "BullMQ logs a warning and drops the job",
+            "add() resolves with a job id, the request returns 201, and the job waits in Redis forever with nothing logged",
+            "The job is delivered to the closest matching queue"
+          ],
+          "answer": 2,
+          "explain": "Producing and consuming are decoupled by design, so nothing on the API side can tell the difference. Queue depth is the only place this shows up."
+        },
+        {
+          "q": "What does concurrency on a Worker control?",
+          "options": [
+            "How many worker processes BullMQ starts",
+            "How many jobs that one worker instance processes simultaneously",
+            "How many retry attempts run in parallel",
+            "How many Redis connections the queue opens"
+          ],
+          "answer": 1,
+          "explain": "It is a per-worker parallelism budget. For CPU-bound work like sharp, keep it low — two to four — or the box becomes unresponsive."
+        }
+      ],
+      "resources": [
+        {
+          "label": "BullMQ documentation",
+          "url": "https://docs.bullmq.io"
+        },
+        {
+          "label": "BullMQ: Workers",
+          "url": "https://docs.bullmq.io/guide/workers"
+        },
+        {
+          "label": "Redis documentation",
+          "url": "https://redis.io/docs/latest/"
+        },
+        {
+          "label": "roadmap.sh: Backend",
+          "url": "https://roadmap.sh/backend"
+        }
+      ],
+      "trap": {
+        "title": "Two ways a job silently never runs",
+        "content": "Both of these produce a successful API response, no error log, no crash, and no job. Do them on purpose, today, in `file-vault-api`.\n\n**Failure 1 — nobody is listening.**\n\nIn the upload route, change the producer's queue name to something no worker constructs:\n\n```ts\nawait new Queue(\"thumbnails\", { connection: redis }).add(\"generate\", {\n  fileId: file.id,\n  storagePath: file.storage_path,\n});\n// note the trailing \"s\" — the worker listens on \"thumbnail\"\n```\n\nUpload an image. You get a 201. `add()` resolved with a real job id. Redis is faithfully holding a job in a list that no `Worker` will ever read. Then check the queue you thought you used:\n\n```ts\nawait thumbnailQueue.getWaitingCount(); // 0 — the right queue is empty\n```\n\nThe job is real, durable, and orphaned. Nothing in your logs mentions it, because nothing went wrong. The same thing happens if you typo the *worker's* name instead, or add a fourth queue and forget to construct its worker, or deploy the API without deploying the worker.\n\n**Failure 2 — the worker isn't running.**\n\nStop the worker process. Leave the API up. Upload five images. Every request returns 201 in about 200ms — faster than usual, because nothing is competing for CPU. The app looks perfect. Then look at the rail:\n\n```bash\nredis-cli LLEN bull:thumbnail:wait   # 5\n```\n\nStart the worker and watch all five fire at once. Now imagine that gap was a long weekend, the queue holds forty thousand jobs, and the first thing your freshly deployed worker does is attempt all of them.\n\n**What both prove.** The API cannot distinguish \"the job ran\" from \"the job will never run,\" because it never knew either way. The only honest signal lives on the queue: waiting count, failed count, the age of the oldest waiting job, and whether a worker has checked in recently. Add an authenticated `GET /admin/queues` that returns `getWaitingCount()`, `getActiveCount()`, and `getFailedCount()` for each queue. Look at it after every deploy, and alert when waiting count stays above a threshold for more than a few minutes. It's the cheapest observability you will ever build, and the reason to build it is that you have now seen both silences yourself."
+      }
+    },
+    "m3-5": {
+      "content": "## The problem\n\nAn iPhone photo is 4 MB. Sometimes 12. Your upload endpoint reads the entire multipart body, buffers it, *then* checks the user's storage quota, and returns 413. The user just spent 12 MB of cellular data to be told no. Next, someone uploads `resume.exe` renamed to `resume.jpg`, and your server stores it happily and later hands it back labelled `image/jpeg` — because you trusted the content type the client sent.\n\nAnd then the one that ends up in an incident review. A bucket set to public, because \"the URLs have UUIDs in them, nobody can guess those.\" Then a link gets pasted in a Slack channel, or an analytics SDK captures the image URL, or someone screenshots a support ticket with the URL bar visible. No expiry, no revocation, no per-user check, no record of who fetched what. The file was never protected. It was just hard to find.\n\n## The idea\n\nAn upload is an assembly line, and the order of the stations *is* the design.\n\n```text\nmultipart request\n  → multer parses the stream          reject early: size, count, MIME\n  → validate quota and permissions    cheap reads, before you commit bytes\n  → Supabase Storage, private bucket  returns a storage path\n  → row in `files` describing it      path, real name, size, owner\n  → enqueue the thumbnail job         the slow part leaves\n  → 201\nlater: client asks for a signed URL   short-lived, minted on demand\n```\n\nAirport check-in is the analogy: they look at your ticket and weigh the bag *before* it goes on the belt, because once it's on the belt, getting it back off is work.\n\nThe database row is the file's identity. Storage holds bytes at a path; the row holds who owns it, what it's called, how big it is, and what it belongs to. Anything you want to query, authorize on, or list belongs in the row — never encoded into the object's name.\n\n## In practice\n\nMulter turns a `multipart/form-data` stream into `req.file`. Its limits are the first line of defence, because they abort the stream mid-flight instead of after:\n\n```ts\nexport const upload = multer({\n  storage: multer.memoryStorage(),\n  limits: {\n    fileSize: env.MAX_FILE_SIZE_MB * 1024 * 1024,\n    files: 1,\n  },\n  fileFilter: (_req, file, cb) => {\n    if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {\n      cb(new Error(`File type ${file.mimetype} is not allowed`));\n      return;\n    }\n    cb(null, true);\n  },\n});\n```\n\n`memoryStorage` gives you `req.file.buffer`, which is right when the next hop is cloud storage and wrong for a 2 GB video (that's `diskStorage`, plus a cleanup story you now own). `files: 1` matters more than it looks: without it, one request can carry a hundred files each individually under your size limit.\n\nThen, before a single byte goes to storage:\n\n```ts\nconst usage = await getStorageUsage(userId);\nconst quotaBytes = env.STORAGE_QUOTA_MB * 1024 * 1024;\n\nif (usage.total_bytes + req.file.size > quotaBytes) {\n  return res.status(413).json({\n    error: \"Storage quota exceeded\",\n    used_bytes: usage.total_bytes,\n    quota_bytes: quotaBytes,\n  });\n}\n```\n\nStorage path: a UUID you generate, under a prefix you control.\n\n```ts\nconst ext = path.extname(input.originalName).slice(1) || \"bin\";\nconst storagePath = `${userId}/${randomUUID()}.${ext}`;\n```\n\nThe client-supplied filename never touches the path. `../../../etc/passwd` becomes a UUID; a 300-character emoji filename becomes a UUID; two files called `report.pdf` never collide. The original name goes in the row, for display only.\n\nStorage first, then the row — the row needs the path, and an orphan object is a cheaper problem than a row pointing at nothing:\n\n```ts\nconst { error: uploadError } = await supabase.storage\n  .from(\"vault\")\n  .upload(storagePath, input.buffer, {\n    contentType: input.mimeType,\n    upsert: false,\n  });\nif (uploadError) throw uploadError;\n\nconst { data, error: dbError } = await supabase\n  .from(\"files\")\n  .insert({ user_id: userId, name: input.originalName, storage_path: storagePath })\n  .select()\n  .single();\n\nif (dbError) {\n  await supabase.storage.from(\"vault\").remove([storagePath]); // compensating delete\n  throw dbError;\n}\n```\n\nThat `remove` isn't decoration. Storage and Postgres are two systems and there is no transaction spanning them. You either write the compensating delete or you accept a bucket that quietly accumulates garbage nobody can see — and pay for it every month.\n\nDownloads. The bucket is **private**, so there is no URL to link to. You mint one:\n\n```ts\nconst { data } = await supabase.storage\n  .from(\"vault\")\n  .createSignedUrl(storagePath, 3600);\n```\n\nA signed URL is a path, an expiry, and an HMAC over both. Tamper with either and the signature stops matching; after an hour it stops working regardless. Same construction as an S3 presigned URL. The important part is what happens *before* the mint: your own authorization code decides whether this user may have this file. That's what makes access revocable, self-expiring, and visible in your logs.\n\nFinally the slow work leaves, and the user gets their response:\n\n```ts\nawait thumbnailQueue.add(\"generate\", {\n  fileId: file.id,\n  storagePath,\n  mimeType: file.mime_type,\n});\n```\n\n## In your world\n\n`file-vault-api`'s `src/middleware/upload.ts`, `src/services/file.service.ts`, and `src/routes/files.ts` are this pipeline. Notice that the quota check lives in the route while the rollback lives in the service — read both and decide whether you agree with where that line sits. Then add the missing piece: real content sniffing. Read the first bytes of the buffer and compare them against what the client claimed. A JPEG starts `FF D8 FF`; a PNG starts `89 50 4E 47`.\n\nThen look at your own avatar flow, which you've written many times: `formData.append(\"file\", { uri, name, type })`. That `type` is *your* guess, handed over by the image picker; on the server it's a claim. And when your app caches an image URL and shows a broken image an hour later, you now know exactly which line did it — a signed URL persisted somewhere it shouldn't be. Store the file id, ask for a fresh URL.\n\n## Watch out\n\n- **Content type is a claim.** So is the filename, and so is the extension. Sniff bytes for anything you'll render, transform, or hand back with a content type.\n- **Handle `MulterError` explicitly.** A file over `fileSize` throws `LIMIT_FILE_SIZE` from the middleware, not from your handler. Without a branch for it, your API returns 500 for a user error and your logs fill with noise.\n- **\"Unguessable\" is not access control.** A public bucket has no expiry, no revocation, no per-user check, and no audit trail. Private bucket plus short-lived signed URLs, always, for anything a user wouldn't paste into a group chat.\n- **Never let the client choose the storage path.** Not the folder, not the filename, not the extension. Derive all three server-side.\n- **Deleting the row must delete the bytes.** Do it in the same code path or in a reaper job, and decide up front what happens when the storage delete fails but the row must still go.",
+      "tasks": [
+        "Trace one upload through upload.ts, files.ts and file.service.ts, and write out the stations in the order they actually execute.",
+        "Move the quota check as early as you can, return 413 with used_bytes and quota_bytes, and note what stops you from checking before any bytes arrive.",
+        "Add magic-byte sniffing for images and reject an executable renamed to .jpg; confirm the response is a 400 that names the real problem.",
+        "Handle MulterError LIMIT_FILE_SIZE explicitly so an oversized file returns 413 instead of a generic 500.",
+        "Delete the compensating storage remove, force the DB insert to fail, then find the orphan object in the bucket and put the remove back.",
+        "Make the bucket public briefly, fetch a file with no auth header, then set it private and confirm the same URL fails; write down what that proves about unguessable URLs.",
+        "Return file ids from the API and mint signed URLs on demand; cache one for an hour and watch it expire."
+      ],
+      "quiz": [
+        {
+          "q": "Why upload the bytes to storage before inserting the database row?",
+          "options": [
+            "Storage is slower, so starting it first overlaps the work",
+            "The row needs the storage path, and an orphan object is a cheaper problem than a row pointing at nothing",
+            "Supabase requires the object to exist before an insert",
+            "It lets you skip the quota check"
+          ],
+          "answer": 1,
+          "explain": "There is no transaction across storage and Postgres. Order the steps so the failure you can end up with is the one you can clean up, and write the compensating delete for it."
+        },
+        {
+          "q": "Why is the storage path a generated UUID instead of the client's filename?",
+          "options": [
+            "UUIDs compress better",
+            "It removes path traversal, collisions and encoding problems in one move, and the real name still lives in the row",
+            "Supabase Storage rejects filenames with spaces",
+            "It makes the file unguessable, which is the access control"
+          ],
+          "answer": 1,
+          "explain": "Anything client-supplied is a claim. Deriving the path server-side turns a malicious or awkward filename into a harmless UUID while the display name stays in the database."
+        },
+        {
+          "q": "What does a signed URL actually contain?",
+          "options": [
+            "An encrypted copy of the file path",
+            "The path, an expiry, and an HMAC over both — so tampering breaks the signature and time breaks the URL",
+            "A one-time token stored in the database",
+            "The user's JWT"
+          ],
+          "answer": 1,
+          "explain": "The signature is what makes it unforgeable and the expiry is what makes it temporary. It is the same construction as an S3 presigned URL."
+        },
+        {
+          "q": "Why is a public bucket with UUID filenames not access control?",
+          "options": [
+            "UUIDs can be brute-forced quickly",
+            "There is no expiry, no revocation, no per-user check and no audit trail, and URLs leak through logs, analytics and screenshots",
+            "Public buckets are slower",
+            "Supabase charges more for public egress"
+          ],
+          "answer": 1,
+          "explain": "Obscurity gives you no ability to say no later. A private bucket plus short-lived signed URLs puts your own authorization code on the path every time."
+        },
+        {
+          "q": "When would you choose multer's diskStorage over memoryStorage?",
+          "options": [
+            "When forwarding straight to cloud storage",
+            "For large files, or when a tool needs a real file on disk — accepting that you now own the cleanup",
+            "When you need MIME validation",
+            "When the client sends multiple files"
+          ],
+          "answer": 1,
+          "explain": "memoryStorage is right when the buffer's next stop is an upload call. Multi-gigabyte files or shell tools like ffmpeg need a path on disk, and temp files you must delete."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Multer (Express middleware)",
+          "url": "https://expressjs.com/en/resources/middleware/multer.html"
+        },
+        {
+          "label": "Supabase Storage",
+          "url": "https://supabase.com/docs/guides/storage"
+        },
+        {
+          "label": "sharp documentation",
+          "url": "https://sharp.pixelplumbing.com/"
+        },
+        {
+          "label": "roadmap.sh: API security best practices",
+          "url": "https://roadmap.sh/best-practices/api-security"
+        }
+      ]
+    },
+    "m3-6": {
+      "content": "## The problem\n\nThree screens in the file vault, three self-inflicted wounds.\n\n**The folder tree.** You fetched the root folders, then for each root its children, then for each of those theirs — one request per node. Four levels deep and forty folders, and the sidebar takes six seconds on hotel Wi-Fi. You've written this loop in a React Native app and blamed the network.\n\n**The metadata.** Images need width and height. PDFs need a page count. Videos need duration and codec. You added five nullable columns, then a sixth, and now every migration adds a column that's NULL for 95% of rows and a `?.` in every consumer.\n\n**The usage bar.** `GET /usage` runs `SELECT COUNT(*), SUM(size_bytes) FROM files WHERE user_id = $1`. Instant at 200 files. At 200,000 it's 900ms, it runs on every screen open, and it's the slowest query in your logs — to render a progress bar nobody reads to the byte.\n\n## The idea\n\nThree Postgres features with intimidating names and small ideas underneath.\n\n**Recursive CTE** — a loop whose queue is a result set. Start with a row, find its children, find *their* children, stop when a pass returns nothing. It's the tree traversal you were writing in JavaScript, moved to where the data already lives, so it costs one round trip instead of forty.\n\n**JSONB** — a `Record<string, unknown>` column that Postgres actually understands. Stored as a parsed binary structure, so you can read inside it, filter on it, and index it. Use it for fields that genuinely differ from row to row.\n\n**Materialized view** — a memoized selector with manual invalidation. A regular view is a saved *query*, re-run on every read. A materialized view is a saved *answer*, stored as a real table, recomputed when you say so. You trade freshness for a lookup that costs the same at 200 rows and 200,000.\n\n## In practice\n\nThe tree, in one query. `folders.parent_folder_id` references `folders.id` — a self-referential foreign key, which is all a tree is.\n\n```sql\nWITH RECURSIVE folder_tree AS (\n  -- base case: where to start\n  SELECT f.id, f.parent_folder_id, f.name, f.path, 0 AS depth\n  FROM folders f\n  WHERE f.user_id = $1 AND f.id = $2\n\n  UNION ALL\n\n  -- recursive case: children of whatever the previous pass found\n  SELECT f.id, f.parent_folder_id, f.name, f.path, ft.depth + 1\n  FROM folders f\n  JOIN folder_tree ft ON f.parent_folder_id = ft.id\n  WHERE f.user_id = $1\n)\nSELECT * FROM folder_tree ORDER BY path;\n```\n\nIt runs in passes. Pass 0 finds `Documents`. Pass 1 joins against pass 0's rows and finds `Work` and `Personal`. Pass 2 finds `Reports` and `Invoices`. Pass 3 finds nothing, so it stops. `depth` comes along free and gives the client its indentation.\n\nNote `user_id = $1` in *both* halves. An ownership filter that appears only in the base case is an authorization hole — the recursion walks straight into someone else's rows the moment a `parent_folder_id` crosses accounts.\n\nJSONB, for metadata that differs by file type:\n\n```sql\nmetadata jsonb NOT NULL DEFAULT '{}'\n```\n\n```sql\n-- read a field: ->> returns text, -> returns jsonb\nSELECT metadata->>'thumbnail_path' FROM files WHERE id = $1;\n\n-- merge, without clobbering the other keys\nUPDATE files SET metadata = metadata || '{\"thumbnail_path\":\"x/y_thumb.jpg\"}'::jsonb\nWHERE id = $1;\n\n-- only once you genuinely filter on it\nCREATE INDEX idx_files_metadata ON files USING GIN (metadata);\n```\n\nThe rule: **JSONB is for data you don't query on structurally.** The moment a field shows up in a `WHERE` on a hot path, or wants a `NOT NULL`, a foreign key, or a `CHECK`, it wants to be a column. `size_bytes` is a column — you sum it, you enforce a quota with it. `codec` is JSONB — you display it. And if you do filter inside JSONB, index it: a GIN index makes containment queries like `metadata @> '{\"codec\":\"h264\"}'` fast, where a B-tree can't help at all.\n\nThe usage bar, precomputed:\n\n```sql\nCREATE MATERIALIZED VIEW user_storage_usage AS\nSELECT user_id, COUNT(*) AS file_count, COALESCE(SUM(size_bytes), 0) AS total_bytes\nFROM files\nGROUP BY user_id;\n\n-- required for CONCURRENTLY, and it makes the read a single index hit\nCREATE UNIQUE INDEX idx_user_storage_usage_user ON user_storage_usage(user_id);\n```\n\nReads become `SELECT * FROM user_storage_usage WHERE user_id = $1`: one row, one index lookup, the same cost at any table size. The catch is that it's wrong the instant anyone uploads anything. So you refresh it:\n\n```sql\nREFRESH MATERIALIZED VIEW CONCURRENTLY user_storage_usage;\n```\n\n`CONCURRENTLY` builds the new copy alongside the old one and swaps them, so readers are never blocked — which is exactly why the unique index is mandatory. Refresh from a job after uploads and deletes, or on a schedule with pg_cron. Either way you have chosen to be a little bit wrong, on purpose, in exchange for a screen that loads. That's what **stale by design** means, and it's only acceptable when being slightly wrong is harmless.\n\n## In your world\n\nAll three live in `file-vault-api`: `get_folder_tree()` in the migration, `files.metadata` on every uploaded file, and `user_storage_usage` behind `getStorageUsage()`. Work to do: add a cycle guard to the recursive CTE, add the GIN index plus a query that uses it, then break the view on purpose — set `STORAGE_QUOTA_MB` tiny, upload past the quota *without* refreshing, and watch the quota check wave you through. That's exactly the bug you'd ship by using a materialized view as an enforcement mechanism.\n\nYour work backend precomputes feed data in background jobs for the same reason: some answers are too expensive to compute per request, so they're computed on a schedule and served slightly stale. Different table, identical bargain — and the same question to ask before you accept it: what breaks if this number is thirty seconds out of date?\n\n## Watch out\n\n- **A recursive CTE with a cycle never terminates.** If a folder ever becomes its own ancestor — a bad move, a bad import — the query runs until something kills it. Carry visited ids in an array and add `WHERE NOT f.id = ANY(ft.visited)`, or cap `depth`.\n- **JSONB has no constraints.** No foreign keys, no NOT NULL, no type checking. `{\"widht\": 1920}` is a perfectly valid write, and you find out three weeks later when no thumbnail has a width.\n- **`metadata->>'width' > '1000'` compares strings.** `'900' > '1000'` is true. Cast it: `(metadata->>'width')::int > 1000`.\n- **Never enforce a hard limit from a materialized view.** Quotas that must not be exceeded, balances, anything billable — those need a live count or a trigger-maintained counter. The view is for the progress bar, not the gate.\n- **`REFRESH` recomputes everything.** It's a full scan and aggregate. Refreshing after every single upload on a busy system costs more than the query you were avoiding, so debounce it.\n\n## Checkpoint\n\nSix questions. Out loud, no notes, no editor open.\n\n1. Draw twenty feed rows. Someone posts while the user is reading page 1, then the client asks for page 2 with `OFFSET 20`. Which row does the user see twice, and why? Now show me what the keyset version sends instead — and why the cursor is `(created_at, id)` and not just `created_at`.\n2. Why is the worker a separate process? Name a failure that separation prevents, and one it does not.\n3. Give me two ways an enqueued job silently never runs. For each: what signal would have told you, and where would you have had to look for it?\n4. When is JSONB the wrong choice? Point at a specific field in the file vault you'd refuse to put in `metadata`, and say what you'd lose by putting it there.\n5. `user_storage_usage` is stale by design. Explain the phrase, then name one thing you must never enforce with it and what you'd use instead.\n6. A message is delivered over the socket, but the database write failed. Which is the source of truth, what should the other client be showing, and what makes it correct again?",
+      "tasks": [
+        "Replace the per-node folder fetch with one get_folder_tree() RPC call and count the round trips saved on a four-level tree.",
+        "Add a cycle guard to the recursive CTE, then create a cycle with a manual UPDATE in a scratch database and confirm the guarded query still terminates.",
+        "Repeat the user_id filter in both halves of the CTE, then remove it from the recursive half and demonstrate the rows it lets through.",
+        "Add the GIN index on files.metadata, write a containment query that uses it, and compare EXPLAIN output before and after.",
+        "Find and fix a string-comparison bug: compare metadata->>'width' as text versus cast to int and show the differing results.",
+        "Set STORAGE_QUOTA_MB tiny, upload past the quota without refreshing the materialized view, and document exactly how far over you got.",
+        "Refresh the view from the storage-quota job, then drop the unique index and confirm REFRESH CONCURRENTLY fails.",
+        "Answer all six checkpoint questions out loud with no notes, and write down the ones you fumbled."
+      ],
+      "quiz": [
+        {
+          "q": "How does a recursive CTE know when to stop?",
+          "options": [
+            "At a fixed recursion depth set by Postgres",
+            "When a pass returns no new rows",
+            "When the base case is exhausted",
+            "When it reaches the LIMIT"
+          ],
+          "answer": 1,
+          "explain": "Each pass joins against the previous pass's output. An empty pass ends the recursion — which is also why a cycle never terminates without a guard."
+        },
+        {
+          "q": "Which field belongs in a real column rather than in a JSONB metadata blob?",
+          "options": [
+            "A photo's EXIF camera model",
+            "size_bytes, because you sum it, index it and enforce a quota with it",
+            "A video's codec name",
+            "A PDF's page count"
+          ],
+          "answer": 1,
+          "explain": "JSONB is for data you don't query on structurally. The moment a field needs NOT NULL, a foreign key, a CHECK, or a fast filter on a hot path, it wants to be a column."
+        },
+        {
+          "q": "What is the difference between a view and a materialized view?",
+          "options": [
+            "A view can be indexed; a materialized view cannot",
+            "A view is a saved query re-run on every read; a materialized view is a stored answer that only changes when you refresh it",
+            "A materialized view updates automatically when the underlying rows change",
+            "A view is read-only; a materialized view is writable"
+          ],
+          "answer": 1,
+          "explain": "That stored answer is why reads are a single index lookup at any table size, and also why it is wrong the moment the underlying data changes."
+        },
+        {
+          "q": "REFRESH MATERIALIZED VIEW CONCURRENTLY requires what, and why?",
+          "options": [
+            "A unique index on the view, so the new copy can be built alongside the old and swapped without blocking readers",
+            "An exclusive lock taken in advance",
+            "pg_cron to be installed",
+            "The view to contain no aggregates"
+          ],
+          "answer": 0,
+          "explain": "Without CONCURRENTLY the refresh locks the view and reads stall. With it, Postgres needs the unique index to match old rows to new ones during the swap."
+        },
+        {
+          "q": "What does 'stale by design' mean for user_storage_usage?",
+          "options": [
+            "The view is deprecated and should be replaced",
+            "It is knowingly a little out of date between refreshes, which is fine for a progress bar and unacceptable as a hard quota gate",
+            "It refreshes lazily on first read after a write",
+            "It caches only rows that were read recently"
+          ],
+          "answer": 1,
+          "explain": "You traded accuracy for a constant-cost read. That trade only holds where being slightly wrong is harmless — never for enforcement, balances, or anything billable."
+        }
+      ],
+      "resources": [
+        {
+          "label": "PostgreSQL: WITH queries (CTEs)",
+          "url": "https://www.postgresql.org/docs/current/queries-with.html"
+        },
+        {
+          "label": "PostgreSQL: JSON types",
+          "url": "https://www.postgresql.org/docs/current/datatype-json.html"
+        },
+        {
+          "label": "PostgreSQL: Materialized views",
+          "url": "https://www.postgresql.org/docs/current/rules-materializedviews.html"
+        },
+        {
+          "label": "PostgreSQL: REFRESH MATERIALIZED VIEW",
+          "url": "https://www.postgresql.org/docs/current/sql-refreshmaterializedview.html"
+        },
+        {
+          "label": "roadmap.sh: PostgreSQL DBA",
+          "url": "https://roadmap.sh/postgresql-dba"
+        }
+      ]
+    },
+    "sq-3": {
+      "content": "## The problem\n\nEvery chat app opens on the same screen: a list of conversations, each showing its last message and an unread badge. It looks trivial. It's the hardest query in the product. Fetch the channels, then for each one fetch the newest message, then for each one count the unread — twelve conversations becomes twenty-five queries, and the screen everyone sees first is the slowest one you have.\n\n## The idea\n\n\"For each row in this set, run this small query\" has a name in SQL: `LATERAL`. A normal subquery can't see the outer row. A lateral subquery can, which makes it a `for` loop that runs inside Postgres, using indexes, in one pass — the exact thing you'd otherwise write as `channels.map(...)` with a round trip inside the callback.\n\nPut that query in a **stored function** and the whole screen becomes one call. Read receipts get the matching treatment: an UPSERT, which is one atomic statement instead of a check-then-write race.\n\n## In practice\n\nThe shape to internalize, from `get_user_channels()` in the migration:\n\n```sql\nLEFT JOIN LATERAL (\n  SELECT m.id, m.content, m.sender_id, m.created_at\n  FROM messages m\n  WHERE m.channel_id = c.id          -- references the outer row\n  ORDER BY m.created_at DESC\n  LIMIT 1\n) lm ON true\n```\n\n`ON true` because the join condition already lives inside the subquery. `LEFT` because an empty channel still belongs in the list. And it's fast for the same reason the previous modules were: `idx_messages_channel_created` is `(channel_id, created_at DESC)`, so \"newest in this channel\" is one index seek per row.\n\nRead receipts, atomically:\n\n```sql\nINSERT INTO read_receipts (user_id, channel_id, last_read_message_id, last_read_at)\nVALUES ($1, $2, $3, now())\nON CONFLICT (user_id, channel_id)\nDO UPDATE SET last_read_message_id = $3, last_read_at = now();\n```\n\nCheck-then-insert has a race two devices will find within a day: both read \"no receipt,\" both insert, one gets a duplicate-key error you then have to pretend was success.\n\n## In your world\n\nWork through `chat-app-api/LEARNING.md` end to end: junction table and composite primary key for `channel_members`, DM deduplication (two people, one conversation, however many times they tap \"message\"), the DESC index, `.rpc('get_user_channels')`, and the fire-and-forget notification call in `src/routes/messages.ts` — the pattern you replaced with a real queue in the file vault. Finish with its verification checklist, out loud.\n\nThe transferable pattern is the last-message-per-group join. Your work backend needs it anywhere a list shows a summary of its children: the newest comment on a post, the latest activity per group.\n\n## Watch out\n\n- **A lateral join per row is still a query per row** — just without the network. It's fast because of the index. Without `(channel_id, created_at DESC)` it degrades into a sort per channel.\n- **Stored functions are code with no code review and no types.** They're invisible to your TypeScript and live only in migrations. Use them where they earn it, and never as the place your business rules quietly accumulate.\n- **UPSERT needs a real unique constraint** to conflict on. `ON CONFLICT (user_id, channel_id)` only works because that pair is the primary key.",
+      "tasks": [
+        "Implement get_user_channels() with the LATERAL join for last message plus an unread count, and call it with .rpc() from the channel service.",
+        "Compare it against the naive version: count the queries the N+1 approach issues for twelve channels, then count them for the RPC.",
+        "Implement markAsRead with an UPSERT on the (user_id, channel_id) primary key, and fire two concurrent requests to prove no duplicate-key error escapes.",
+        "Add DM deduplication so tapping 'message' twice on the same person returns the existing conversation instead of creating a second one.",
+        "Work through the verification checklist at the end of chat-app-api/LEARNING.md and answer every question out loud."
+      ],
+      "quiz": [
+        {
+          "q": "What can a LATERAL subquery do that a normal subquery cannot?",
+          "options": [
+            "Return more than one row",
+            "Reference columns from the outer query, which makes it a per-row 'for each'",
+            "Use an index",
+            "Be written inside a stored function"
+          ],
+          "answer": 1,
+          "explain": "That outer reference is the whole feature: 'for each channel, its newest message' becomes one query plan instead of one query per channel."
+        },
+        {
+          "q": "Why UPSERT instead of check-then-insert for a read receipt?",
+          "options": [
+            "It sends less data over the wire",
+            "It is one atomic statement, so two concurrent requests cannot both decide the row is missing",
+            "It skips constraint checks",
+            "It avoids needing a primary key"
+          ],
+          "answer": 1,
+          "explain": "Check-then-insert is two statements with a gap. Two devices marking read at once both see 'no receipt', both insert, and one gets a duplicate-key error you then have to swallow."
+        },
+        {
+          "q": "The last-message LATERAL join is fast because of what?",
+          "options": [
+            "The stored function is precompiled",
+            "An index on (channel_id, created_at DESC) turns 'newest in this channel' into one seek per row",
+            "Postgres caches the subquery result",
+            "LATERAL joins are executed in parallel"
+          ],
+          "answer": 1,
+          "explain": "Without that index, each lateral iteration sorts the channel's messages. The pattern only pays off when the index matches it."
+        }
+      ],
+      "resources": [
+        {
+          "label": "PostgreSQL: Table expressions (LATERAL)",
+          "url": "https://www.postgresql.org/docs/current/queries-table-expressions.html"
+        },
+        {
+          "label": "PostgreSQL: INSERT ... ON CONFLICT",
+          "url": "https://www.postgresql.org/docs/current/sql-insert.html"
+        },
+        {
+          "label": "Supabase: Database functions",
+          "url": "https://supabase.com/docs/guides/database/functions"
+        }
+      ]
+    },
+    "sq-4": {
+      "content": "## The problem\n\nSharing is where file apps leak. A user shares a folder with a colleague, who can then open every file inside it — including the one moved in yesterday. Now express that as code. Who can read this file: the owner, anyone it was shared with directly, anyone given an ancestor folder, and nobody whose share expired at midnight. Get one branch wrong and it isn't a bug, it's a disclosure.\n\n## The idea\n\nTwo ideas carry the whole feature.\n\n**Permissions form a hierarchy, not a set.** `admin > edit > view`. You don't check \"does this user have exactly `view`\" — you check \"does this user hold *any* level that grants `view`.\" Written as a lookup table instead of a chain of `if`s, that's four lines and no room for a missed case.\n\n**A share points at exactly one thing.** A file, or a folder, never both, never neither. Two nullable columns plus a `CHECK` constraint expresses that in the one place that can't be bypassed: the database. Zod's `.refine()` mirrors the same rule at the API edge so the user gets a 400 instead of a 500, but Zod cannot protect you from a migration, a script, or your own future service code.\n\n## In practice\n\nThe hierarchy, and the ordering of the access check:\n\n```ts\nconst grants: Record<string, string[]> = {\n  view: [\"view\", \"edit\", \"admin\"],\n  edit: [\"edit\", \"admin\"],\n  admin: [\"admin\"],\n};\n```\n\nOwner first, because the common case should cost zero extra queries; then shares; then expiry. And a share row that has passed `expires_at` is not deleted — it's filtered on read, so revocation and history both work.\n\nThe constraint that makes the polymorphic column pair honest:\n\n```sql\nCONSTRAINT share_target_check CHECK (\n  (file_id IS NOT NULL AND folder_id IS NULL) OR\n  (file_id IS NULL AND folder_id IS NOT NULL)\n)\n```\n\n## In your world\n\nWork through `file-vault-api/LEARNING.md` and finish the build: share routes with `.refine()` cross-field validation, the permission hierarchy in `src/services/share.service.ts`, inherited folder permissions (walk the ancestor chain with the recursive CTE you already have — a share on `/Work` must cover `/Work/Reports/q3.pdf`), and `user_storage_usage` refreshed from the storage-quota job. Then run its verification checklist cold.\n\nWhat transfers is the check order and the constraint. Your work backend enforces access with row-level security instead of a service function, but the reasoning is identical: put the rule where it cannot be forgotten, and make the cheapest check the first one.\n\n## Watch out\n\n- **Inherited permissions need the ancestor chain, not the immediate parent.** A share on a grandparent folder still grants access, so the check has to walk upward — or you precompute the chain.\n- **Expiry must be applied on every read path.** One list endpoint that forgets `expires_at` is a revoked share that still works.\n- **`CHECK` is validated on write, not retroactively.** Adding it to a table that already holds bad rows fails the migration, which is good news you'd rather get in dev.",
+      "tasks": [
+        "Implement the permission hierarchy as a lookup table and make the access check try ownership first, shares second, expiry last.",
+        "Add the share_target_check CHECK constraint, then try to insert a share with both file_id and folder_id set and read the error Postgres returns.",
+        "Mirror the same rule with a zod .refine() and confirm the API returns 400 for the same payload instead of surfacing a database error.",
+        "Extend access checks to inherited folder permissions using the recursive CTE, and prove a share on a grandparent folder grants access to a nested file.",
+        "Set expires_at in the past on one share and confirm every list and read path filters it out, not just the one you remembered.",
+        "Refresh user_storage_usage from the storage-quota job and confirm /usage reflects a deletion after the job runs, not before.",
+        "Work through the verification checklist at the end of file-vault-api/LEARNING.md and answer every question cold."
+      ],
+      "quiz": [
+        {
+          "q": "What does the CHECK constraint on the shares table prevent that a zod .refine() cannot?",
+          "options": [
+            "A malformed API request body",
+            "Invalid rows written by a migration, a script, or service code that skipped the schema",
+            "A missing foreign key target",
+            "Two users sharing the same file"
+          ],
+          "answer": 1,
+          "explain": "Zod guards the API edge, which is where you want the friendly 400. The constraint guards the data itself, which is the only layer nothing can bypass."
+        },
+        {
+          "q": "Why does the access check test ownership before looking at shares?",
+          "options": [
+            "Owners have a different permission level",
+            "It is the common case and it answers without querying the shares table at all",
+            "Shares are stored in a different database",
+            "Row-level security requires it"
+          ],
+          "answer": 1,
+          "explain": "Cheapest check first. Most reads are by the owner, so the fast path avoids a join and the hierarchy lookup entirely."
+        },
+        {
+          "q": "A user was granted 'edit' on a folder. What should a 'view' check return?",
+          "options": [
+            "False — the levels do not match exactly",
+            "True — edit grants view, because permissions form a hierarchy",
+            "True only if a separate view share also exists",
+            "It depends on whether the share has expired, and nothing else"
+          ],
+          "answer": 1,
+          "explain": "admin implies edit implies view. Expressing that as a lookup table of which levels satisfy a requirement removes the chance of missing a branch."
+        }
+      ],
+      "resources": [
+        {
+          "label": "PostgreSQL: Constraints",
+          "url": "https://www.postgresql.org/docs/current/ddl-constraints.html"
+        },
+        {
+          "label": "Zod documentation",
+          "url": "https://zod.dev"
+        },
+        {
+          "label": "Supabase Storage",
+          "url": "https://supabase.com/docs/guides/storage"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,164 @@
+{
+  "meta": {
+    "title": "Backend Mastery — 45-Day Expedition",
+    "owner": "Aswin",
+    "githubOwner": "Aswin-Dot",
+    "githubRepo": "backend-mastery",
+    "dailyMinutesDefault": 90,
+    "totalDays": 45,
+    "version": 2,
+    "description": "A curated 45-day path from React Native developer to production-capable backend engineer: Node/Express fundamentals, PostgreSQL + Supabase, five hands-on projects, NestJS, a real production codebase, DevOps, AWS, and system design. One module per day at 1–2 hrs/day; side quests are optional extras that never block the path."
+  },
+  "phases": [
+    {
+      "id": "p0",
+      "num": 0,
+      "title": "Foundations",
+      "tagline": "The backend mental model — from fetch() to a layered server",
+      "days": "Days 1–6",
+      "color": "#e8a33d",
+      "modules": [
+        { "id": "m0-1", "day": 1, "title": "The journey of a request", "summary": "What actually happens when your RN app calls fetch() — DNS, TLS, the server, and the response, told as a story you can debug.", "estMinutes": 60, "type": "lesson", "tags": ["http", "networking"] },
+        { "id": "m0-2", "day": 2, "title": "HTTP: the contract language", "summary": "Methods, status codes, headers, idempotency — why PUT twice is fine but POST twice double-charges.", "estMinutes": 60, "type": "lesson", "tags": ["http", "api-design"] },
+        { "id": "m0-3", "day": 3, "title": "Your first server", "summary": "Node + Express hello API: routes, path params, JSON in/out. The moment the other side of fetch() stops being magic.", "estMinutes": 75, "type": "build", "tags": ["node", "express"] },
+        { "id": "m0-4", "day": 4, "title": "The middleware pipeline", "summary": "Auth, logging, and error handling as an assembly line — and why the order of the line changes everything.", "estMinutes": 75, "type": "lesson", "tags": ["express", "architecture"] },
+        { "id": "m0-5", "day": 5, "title": "Guard the boundary: validation, env, logs", "summary": "Zod as the bouncer at the door, env validation at startup, structured logging with pino — the three habits that make code production-grade before it's clever.", "estMinutes": 90, "type": "build", "tags": ["validation", "zod", "config", "logging"] },
+        { "id": "m0-7", "day": 6, "title": "Layering + the Notes API", "summary": "route → service → data. Build a layered Notes API with soft delete and honest 404s. First checkpoint.", "estMinutes": 90, "type": "checkpoint", "tags": ["architecture", "express"] }
+      ]
+    },
+    {
+      "id": "p1",
+      "num": 1,
+      "title": "The Data Layer",
+      "tagline": "SQL, PostgreSQL, and what Supabase actually is",
+      "days": "Days 7–10",
+      "color": "#5fb4a2",
+      "modules": [
+        { "id": "m1-1", "day": 7, "title": "SQL crash course I: tables & CRUD", "summary": "Tables, types, constraints, and the four verbs — designed so you stop translating SQL in your head.", "estMinutes": 75, "type": "lesson", "tags": ["sql", "postgres"] },
+        { "id": "m1-2", "day": 8, "title": "SQL crash course II: joins & shapes", "summary": "1:N, M:N, join types, aggregations — every relationship your app's screens already imply.", "estMinutes": 75, "type": "lesson", "tags": ["sql", "postgres"] },
+        { "id": "m1-3", "day": 9, "title": "Indexes & transactions", "summary": "The B-tree mental model, EXPLAIN 101, ACID, and when Postgres locks — why one missing index makes a screen take 4 seconds.", "estMinutes": 90, "type": "lesson", "tags": ["sql", "performance", "postgres-dba"] },
+        { "id": "m1-4", "day": 10, "title": "Supabase 101", "summary": "What's actually running behind that dashboard — Postgres, Auth, Realtime, Storage — plus project setup and the migrations concept.", "estMinutes": 60, "type": "lesson", "tags": ["supabase"] }
+      ]
+    },
+    {
+      "id": "p2",
+      "num": 2,
+      "title": "Project 1: Task Manager",
+      "tagline": "Your first real API — auth, schema, RLS, services",
+      "days": "Days 11–14",
+      "color": "#7ea16b",
+      "modules": [
+        { "id": "m2-1", "day": 11, "title": "Build: scaffold, env, auth", "summary": "Scaffold the Task Manager API: env validation, pino, and Supabase JWT auth middleware — a real login your RN app could use.", "estMinutes": 90, "type": "build", "tags": ["auth", "supabase", "express"], "project": "task-manager-api" },
+        { "id": "m2-2", "day": 12, "title": "Build: schema, migrations, triggers", "summary": "Design tasks + categories tables, write versioned migrations, add an updated_at trigger and the indexes your queries need.", "estMinutes": 90, "type": "build", "tags": ["sql", "migrations"], "project": "task-manager-api" },
+        { "id": "m2-3", "day": 13, "title": "Build: RLS — rows that don't exist", "summary": "Row-level security for own-data access — including the deliberate manual-WHERE-clause trap that shows why 'remember the WHERE' is not a security model.", "estMinutes": 90, "type": "build", "tags": ["rls", "security"], "project": "task-manager-api" },
+        { "id": "m2-4", "day": 14, "title": "Build: services, filters, ship it", "summary": "Service layer, dynamic query filters, and the verification checklist. Checkpoint: explain any line cold.", "estMinutes": 90, "type": "checkpoint", "tags": ["architecture"], "project": "task-manager-api" }
+      ]
+    },
+    {
+      "id": "p3",
+      "num": 3,
+      "title": "Real-time, Jobs & Files",
+      "tagline": "The concepts behind every chat screen, upload, and background task",
+      "days": "Days 15–20",
+      "color": "#5a9bd5",
+      "modules": [
+        { "id": "m3-1", "day": 15, "title": "Cursor pagination", "summary": "Why offset pagination breaks infinite scroll (you've seen the duplicated feed items) and how cursors fix it.", "estMinutes": 75, "type": "lesson", "tags": ["sql", "api-design"], "project": "chat-app-api" },
+        { "id": "m3-2", "day": 16, "title": "WebSockets & Supabase Realtime", "summary": "How a message reaches every device in under a second — build the chat core with REST + WS together.", "estMinutes": 90, "type": "build", "tags": ["realtime", "websockets"], "project": "chat-app-api" },
+        { "id": "m3-3", "day": 17, "title": "Presence, typing & rate limits", "summary": "Online status, typing indicators, multi-device tracking — persistent vs ephemeral state — plus token-bucket rate limiting.", "estMinutes": 90, "type": "build", "tags": ["realtime", "security"], "project": "chat-app-api" },
+        { "id": "m3-4", "day": 18, "title": "Background jobs: BullMQ + Redis", "summary": "Slow work leaves the request path. Run a worker as a separate process and hit the two silent-job-loss traps on purpose.", "estMinutes": 90, "type": "build", "tags": ["jobs", "redis"], "project": "file-vault-api" },
+        { "id": "m3-5", "day": 19, "title": "The file pipeline", "summary": "Multer → Supabase Storage → signed URLs → sharp thumbnails in a job. The exact pipeline behind every avatar upload.", "estMinutes": 90, "type": "build", "tags": ["storage", "jobs"], "project": "file-vault-api" },
+        { "id": "m3-6", "day": 20, "title": "Postgres power tools", "summary": "Recursive CTEs (folder trees), JSONB (flexible metadata), materialized views (pre-computed stats). Checkpoint.", "estMinutes": 90, "type": "checkpoint", "tags": ["sql", "postgres-dba"], "project": "file-vault-api" }
+      ]
+    },
+    {
+      "id": "p4",
+      "num": 4,
+      "title": "Production Data Patterns",
+      "tagline": "Money, search, caching, RBAC — plus API design & security done right",
+      "days": "Days 21–27",
+      "color": "#c76f4e",
+      "modules": [
+        { "id": "m4-1", "day": 21, "title": "Money & transactions", "summary": "Prices in cents, atomic order creation, SELECT FOR UPDATE — why two buyers can't both get the last item.", "estMinutes": 90, "type": "build", "tags": ["sql", "transactions"], "project": "marketplace-api" },
+        { "id": "m4-2", "day": 22, "title": "Full-text search", "summary": "tsvector, GIN indexes, weighted ranking — how search bars actually work without an external service.", "estMinutes": 75, "type": "lesson", "tags": ["sql", "search"], "project": "marketplace-api" },
+        { "id": "m4-3", "day": 23, "title": "Caching with Redis", "summary": "Cache-aside, TTLs, and the two hard problems — including the stale-data bug you will absolutely ship once.", "estMinutes": 75, "type": "lesson", "tags": ["caching", "redis", "performance"], "project": "marketplace-api" },
+        { "id": "m4-4", "day": 24, "title": "Query performance", "summary": "EXPLAIN ANALYZE, partial indexes, denormalization tradeoffs — finding the slow query before your users do.", "estMinutes": 90, "type": "lesson", "tags": ["performance", "postgres-dba"], "project": "marketplace-api" },
+        { "id": "m4-5", "day": 25, "title": "RBAC & multi-tenancy", "summary": "Role hierarchies, middleware factories, org-scoped RLS — how one database safely serves many teams.", "estMinutes": 90, "type": "build", "tags": ["security", "rls"], "project": "project-tracker-api" },
+        { "id": "m4-6", "day": 26, "title": "API design that lasts", "summary": "Resource naming, versioning, pagination conventions, error shapes, webhooks — the roadmap.sh api-design track distilled for someone who consumes APIs daily.", "estMinutes": 75, "type": "lesson", "tags": ["api-design"] },
+        { "id": "m4-7", "day": 27, "title": "API security essentials", "summary": "OWASP API Top 10, broken authorization (the #1 real-world hole), secrets handling, rate limiting. Checkpoint.", "estMinutes": 90, "type": "checkpoint", "tags": ["security", "api-security"] }
+      ]
+    },
+    {
+      "id": "p45",
+      "num": 5,
+      "title": "NestJS: The Framework Layer",
+      "tagline": "The opinionated framework your other backend runs on — DI, modules, guards, DTOs",
+      "days": "Days 28–29",
+      "color": "#c14a5e",
+      "modules": [
+        { "id": "m45-1", "day": 28, "title": "NestJS: the framework with opinions", "summary": "Dependency injection, modules, controllers, providers — why big teams trade Express's freedom for Nest's structure. Port a slice of your Task Manager and feel the difference.", "estMinutes": 90, "type": "build", "tags": ["nestjs", "architecture"] },
+        { "id": "m45-2", "day": 29, "title": "NestJS in production", "summary": "DTOs + ValidationPipe, guards vs middleware, interceptors, exception filters, ConfigModule, testing — the patterns your own CLAUDE.md rules already demand, now from the inside.", "estMinutes": 90, "type": "build", "tags": ["nestjs", "security", "testing"] }
+      ]
+    },
+    {
+      "id": "p5",
+      "num": 6,
+      "title": "The Real Codebase",
+      "tagline": "The work codebase: Bun, Hono, Drizzle, RLS pools, twin queues — and your first PRs",
+      "days": "Days 30–36",
+      "color": "#b0413e",
+      "modules": [
+        { "id": "m5-1", "day": 30, "title": "New stack, same ideas", "summary": "Bun vs Node, Hono vs Express, Drizzle vs supabase-js — a translation table for everything you just learned.", "estMinutes": 60, "type": "lesson", "tags": ["bun", "hono", "drizzle"] },
+        { "id": "m5-2", "day": 31, "title": "Repo orientation & route trace", "summary": "Run the work backend locally, read its ARCHITECTURE doc, and hand-trace one route → service → Drizzle query → response schema.", "estMinutes": 90, "type": "build", "tags": ["codebase"] },
+        { "id": "m5-3", "day": 32, "title": "The two DB pools", "summary": "Request-scoped c.get(\"db\") vs the privileged pool — the single most expensive distinction in the codebase, and what 'bypasses RLS' means for real user data.", "estMinutes": 90, "type": "lesson", "tags": ["rls", "security", "codebase"] },
+        { "id": "m5-4", "day": 33, "title": "Twin job queues", "summary": "Two pg-boss instances on separate schemas. Enqueue on the wrong one and watch a job silently never run.", "estMinutes": 75, "type": "lesson", "tags": ["jobs", "codebase"] },
+        { "id": "m5-5", "day": 34, "title": "Append-only migrations", "summary": "Why a migration file is a historical fact, not a draft — hand-edit one in a sandbox and watch two databases diverge.", "estMinutes": 75, "type": "lesson", "tags": ["migrations", "codebase"] },
+        { "id": "m5-6", "day": 35, "title": "Contracts with your own app", "summary": "zod-openapi route schemas, the silent-rename trap, and additive evolution — you ARE the mobile client that breaks.", "estMinutes": 75, "type": "lesson", "tags": ["api-design", "codebase"] },
+        { "id": "m5-7", "day": 36, "title": "Ship PR 1, start PR 2", "summary": "A low-stakes cleanup PR to learn the pipeline, then begin a real feature with a migration, an RLS policy, and a service. Spilling into extra evenings is expected.", "estMinutes": 120, "type": "build", "tags": ["codebase", "git"] }
+      ]
+    },
+    {
+      "id": "p6",
+      "num": 7,
+      "title": "DevOps & AWS",
+      "tagline": "Docker, CI/CD, observability, incident response — and the AWS you actually need",
+      "days": "Days 37–42",
+      "color": "#8862a8",
+      "modules": [
+        { "id": "m6-1", "day": 37, "title": "Docker", "summary": "Images vs containers, Dockerfile for your API, compose with Postgres + Redis — plus why containers make graceful shutdown matter.", "estMinutes": 90, "type": "build", "tags": ["docker", "devops"] },
+        { "id": "m6-2", "day": 38, "title": "CI/CD & the release train", "summary": "GitHub Actions pipelines (lint/type/test on PR), environments, dev → main flow, migrations in CI, Railway — and why on your team merging to main IS the production deploy.", "estMinutes": 105, "type": "build", "tags": ["ci", "cd", "devops", "codebase"] },
+        { "id": "m6-4", "day": 39, "title": "Observability", "summary": "Sentry, PostHog, log levels, alerts — how you find out something broke before users tweet about it.", "estMinutes": 90, "type": "lesson", "tags": ["observability", "devops"] },
+        { "id": "m6-5", "day": 40, "title": "AWS core", "summary": "IAM (least privilege), S3 + presigned URLs, EC2 vs managed services, RDS vs Supabase — with billing guardrails first.", "estMinutes": 90, "type": "lesson", "tags": ["aws"] },
+        { "id": "m6-6", "day": 41, "title": "AWS async & edge", "summary": "Lambda + API Gateway, SQS vs the queues you know, CloudFront/Route53/ACM — the delivery half of AWS.", "estMinutes": 90, "type": "lesson", "tags": ["aws"] },
+        { "id": "m6-7", "day": 42, "title": "Incident response", "summary": "Triage flow, rollback strategies, postmortems without blame — operating like the tech lead you're becoming. Checkpoint.", "estMinutes": 75, "type": "checkpoint", "tags": ["devops", "incident"] }
+      ]
+    },
+    {
+      "id": "p7",
+      "num": 8,
+      "title": "System Design & Mastery",
+      "tagline": "Design the systems you've been building — then prove it all",
+      "days": "Days 43–45",
+      "color": "#d4a13a",
+      "modules": [
+        { "id": "m7-1", "day": 43, "title": "The system design toolkit", "summary": "Back-of-envelope estimation, caching layers, replicas, sharding, idempotency keys — the vocabulary of scale.", "estMinutes": 90, "type": "lesson", "tags": ["system-design"] },
+        { "id": "m7-2", "day": 44, "title": "Design the feed (and the chat)", "summary": "A social app's actual hard problems: fan-out on write vs read, feed warmup jobs, unread counts — then chat + presence at scale.", "estMinutes": 90, "type": "lesson", "tags": ["system-design", "codebase"] },
+        { "id": "m7-3", "day": 45, "title": "Mastery checkpoint", "summary": "Kick off PR 3 (a real security-hardening fix your mentor hands you), answer the final oral checkpoint cold, and map where you go next.", "estMinutes": 90, "type": "checkpoint", "tags": ["codebase", "security"] }
+      ]
+    }
+  ],
+  "sideQuests": [
+    { "id": "sq-1", "phase": "p0", "title": "TypeScript sharpening for backend", "summary": "Generics, unknown-narrowing, discriminated unions — the TS you skip in RN but need for service code.", "estMinutes": 60, "type": "lesson", "optional": true, "tags": ["typescript"] },
+    { "id": "sq-2", "phase": "p1", "title": "Schema design drills", "summary": "Normalization deep dive plus three schema-review exercises with intentionally flawed designs to critique.", "estMinutes": 75, "type": "lesson", "optional": true, "tags": ["sql"] },
+    { "id": "sq-3", "phase": "p3", "title": "Complete the Chat API", "summary": "Finish chat-app-api end-to-end: LATERAL joins, stored functions, UPSERT, full verification checklist.", "estMinutes": 240, "type": "build", "optional": true, "tags": ["realtime"], "project": "chat-app-api" },
+    { "id": "sq-4", "phase": "p3", "title": "Complete the File Vault", "summary": "Finish file-vault-api: permission hierarchy, polymorphic associations with CHECK, storage usage views.", "estMinutes": 240, "type": "build", "optional": true, "tags": ["storage"], "project": "file-vault-api" },
+    { "id": "sq-5", "phase": "p4", "title": "Stripe payments end-to-end", "summary": "PaymentIntents, webhook signature verification, raw body handling — the full marketplace payment flow.", "estMinutes": 180, "type": "build", "optional": true, "tags": ["payments"], "project": "marketplace-api" },
+    { "id": "sq-6", "phase": "p4", "title": "Event sourcing & state machines", "summary": "Order events as the source of truth and enforced status transitions — marketplace-api's most transferable pattern.", "estMinutes": 120, "type": "build", "optional": true, "tags": ["architecture"], "project": "marketplace-api" },
+    { "id": "sq-7", "phase": "p4", "title": "Complete the Project Tracker", "summary": "Table partitioning, human-readable issue keys, change tracking, health checks, graceful shutdown — the full production-patterns build.", "estMinutes": 300, "type": "build", "optional": true, "tags": ["production"], "project": "project-tracker-api" },
+    { "id": "sq-13", "phase": "p45", "title": "Port the Task Manager to NestJS", "summary": "Full port: modules, DI, JwtAuthGuard, DTOs with class-validator, exception filters, e2e tests with Jest — then read a real NestJS boilerplate's src/ layout and recognize every pattern.", "estMinutes": 240, "type": "build", "optional": true, "tags": ["nestjs"], "project": "task-manager-api" },
+    { "id": "sq-8", "phase": "p5", "title": "The mentor's full 4-week ramp", "summary": "Your backend dev's original onboarding doc as a complete track — all deliberate traps, all oral checkpoints.", "estMinutes": 600, "type": "build", "optional": true, "tags": ["codebase"] },
+    { "id": "sq-9", "phase": "p6", "title": "Deploy a project to AWS for real", "summary": "Take one of your five projects live on EC2 + RDS + S3 (or Fargate) with a domain and TLS.", "estMinutes": 300, "type": "build", "optional": true, "tags": ["aws"] },
+    { "id": "sq-10", "phase": "p6", "title": "Supabase deep dive", "summary": "Edge Functions, storage internals, connection pooling with Supavisor, branching workflows.", "estMinutes": 180, "type": "lesson", "optional": true, "tags": ["supabase"] },
+    { "id": "sq-11", "phase": "p7", "title": "More design exercises", "summary": "A media pipeline, a push notification system, offline sync for mobile — three guided design workouts.", "estMinutes": 180, "type": "lesson", "optional": true, "tags": ["system-design"] },
+    { "id": "sq-12", "phase": "p7", "title": "Load testing with k6", "summary": "Write load tests against your Task Manager API, find its breaking point, and fix the first bottleneck.", "estMinutes": 120, "type": "build", "optional": true, "tags": ["performance"] }
+  ]
+}

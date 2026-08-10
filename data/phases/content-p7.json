@@ -1,0 +1,385 @@
+{
+  "phaseId": "p7",
+  "modules": {
+    "m7-1": {
+      "content": "## The problem\n\nSooner or later someone in a planning meeting asks the only question that matters about a feature nobody has built yet: \"will this hold if we 10x?\" They do not want a promise. They want a number and a bottleneck. If the honest answer is a shrug, the decision gets made by whoever sounds most confident, and you learn who was right during an incident six months later.\n\nYou already know how to build the thing. What you are missing is the ten minutes of arithmetic that turns \"I think it's fine\" into \"fine to roughly 40x, then the timeline write path is the wall, and the cheapest fix is a hybrid fan-out.\" That is system design: not a whiteboard ritual invented for interviews, but the part of the job where being roughly right in advance is the value you add.\n\n## The idea\n\nYou have done this before in another unit. On mobile you have 16ms per frame at 60fps, and you know by feel what fits: a layout pass yes, parsing 4MB of JSON no. You never measure that in a meeting — you internalised a few numbers and reason from them. Design is the same move with a different budget: a request and a second.\n\nThe method, in this order, every time:\n\n1. **Clarify requirements.** What must be fast, what may be stale, what must never be lost. Three different guarantees; features rarely need all three.\n2. **Estimate scale.** Users become requests per second, rows per month, bytes per month.\n3. **Sketch the data model.** Access patterns before components — most bad designs are bad schemas wearing a diagram.\n4. **Sketch the components.** Client, load balancer, API, cache, database, queue, worker.\n5. **Name the bottleneck.** One, out loud. If you cannot, you have not estimated.\n6. **Discuss trade-offs.** There is no correct answer, only defended trade-offs and undefended ones.\n\n## In practice\n\n**Numbers to feel**, as orders of magnitude:\n\n| Operation | Order of magnitude |\n|---|---|\n| Main memory read | 100 ns |\n| SSD random read | 100 µs |\n| Network round trip, same region | 0.5 ms |\n| Postgres indexed lookup, warm | 0.5–2 ms |\n| Network round trip, cross-continent | 150 ms |\n| Mobile radio round trip | 50–100 ms |\n\nThree thousand-fold cliffs: memory to SSD, SSD to a same-region hop, that hop to a cross-continent one. The last cliff is why a p95 of 180ms can be almost entirely geography, and why moving the database closer beats tuning the query.\n\n**A worked estimate.** Imagine a social product with 50,000 daily active users — a made-up number, chosen so the arithmetic is easy to redo with your own.\n\n```ts\nconst dau = 50_000;\nconst requestsPerDay = dau * 6 * 4;      // 6 opens, 4 requests each = 1.2M\nconst avgRps = requestsPerDay / 86_400;  // ~14 req/s\nconst peakRps = avgRps * 5;              // evening peak, ~70 req/s\n```\n\nSeventy requests per second is not a scaling problem: one modest instance serves it, provided each request stays off the database's neck. The arithmetic just killed a panic. Now storage:\n\n```ts\nconst postsPerDay = dau * 0.5;                          // 25k posts\nconst rowsPerMonth = postsPerDay * 30 * 1_000;          // ~750 MB of rows\nconst mediaPerMonth = postsPerDay * 0.6 * 500_000 * 30; // ~225 GB of images\n```\n\nMedia outweighs rows three hundred to one, so the design conversation here is object storage and CDN egress, not Postgres. Naming that is worth more than any diagram.\n\n**Up or out.** Vertical scaling means a bigger machine: no code changes, instant, and it runs out. Horizontal means more machines — unlimited, with one precondition. Your service must be **stateless**, so any instance can serve any request.\n\n```ts\n// breaks horizontal scaling: state lives in one process's memory\nconst typing = new Map(); // userId -> conversationId\n```\n\nTwo instances behind a load balancer, and half the requests see an empty map. Move that state to Redis and both agree. Sticky sessions are a workaround, not a fix — the instance still restarts on every deploy. *Reach for horizontal* when traffic is bursty or you need redundancy; *reach for vertical* when the database is the hot spot, because databases scale out last and worst.\n\n**Caching is a hierarchy**, each layer faster and harder to invalidate than the one behind it. A load balancer sits in front of all of it, spreading requests and taking dead instances out of rotation.\n\n| Layer | Serves | Invalidation cost |\n|---|---|---|\n| Client memory | repeat views, zero latency | unreachable; only TTL expiry saves you |\n| CDN | images, avatars, public JSON | a purge call, seconds to minutes |\n| Application cache (Redis) | computed responses, counters | one DELETE, milliseconds |\n| Database buffer cache | hot pages | automatic, not yours to manage |\n\nCache far from the database for speed, close to it for control. Anything on a client needs a short TTL or a version key, because you cannot retract it.\n\n**The database ladder, in order.** Do not skip steps.\n\n1. **Index it.** Highest leverage in all of backend work, and you can already read EXPLAIN ANALYZE.\n2. **Cache it.** Cache-aside on the expensive reads.\n3. **Read replicas.** Writes to the primary, reads to a copy. This buys read throughput and hands you **replication lag** as a correctness bug: a user posts, the write lands on the primary, the read hits a replica 200ms behind, and their own post is missing from their own feed. The fix is routing read-your-own-writes to the primary, not hoping.\n4. **Partition.** One logical table, many physical ones, split by time or tenant. Old partitions become cheap to drop.\n5. **Shard.** Many databases split by key. You lose cross-shard joins, transactions and easy uniqueness. Most products never need this, and saying so out loud is a senior move.\n\n**Async everywhere.** A queue does two jobs: it **decouples** (the API stops caring whether the transcoder is healthy) and it provides **backpressure** (a spike becomes a longer queue instead of a pile of timeouts). Delivery is at least once, so handlers must be idempotent — and the protocol-level version of that is an **idempotency key**, a caller-supplied id that makes a retry a no-op:\n\n```ts\nconst existing = await findPaymentByKey(db, key); // key from the Idempotency-Key header\nif (existing) return existing;                    // a retry, not a second charge\n```\n\n**Consistency, in terms you feel.** Strong means every reader sees the latest write; eventual means readers converge later. You have shipped eventual consistency for years — the optimistic UI update. You bump the like count locally, fire the request, reconcile when the server answers. That reconciliation is the same convergence problem distributed systems argue about. CAP only says that during a network partition you choose between an error and a stale answer. Feeds choose stale; payments choose the error.\n\n**Failure thinking.** Assume every dependency is down right now. Name the **single points of failure** (one instance, one Redis, one region). Put a **timeout** on every outbound call, because an un-timed-out call is an outage waiting for a slow dependency. Retry with **exponential backoff plus jitter**. Add a **circuit breaker** so repeated failures stop the calls for a cooldown instead of preventing recovery. And decide in advance what **graceful degradation** looks like: a two-minute-stale feed from cache beats an error screen, every time.\n\n```ts\nconst delay = Math.min(30_000, 500 * 2 ** attempt);\nawait sleep(delay * (0.5 + Math.random() * 0.5)); // jitter spreads the herd\n```\n\n## In your world\n\nYou built most of this toolkit without the labels. The chat-app-api token bucket lived in process memory — that is the stateless violation above, and why the same limiter behaves differently on two instances. The Redis cache-aside in marketplace-api is layer three of the hierarchy. The BullMQ worker in file-vault-api is the decoupling argument, and the retry semantics you fought are why idempotency keys exist.\n\nYour work backend is already a horizontally split system: an API process, a worker, and a separate feed worker, each scaled independently, plus a request-scoped database handle so any instance can safely serve any user. That shape is somebody else's arithmetic, done before you arrived. Next time you touch a design there, do step 5 explicitly — name the one component that breaks first at 10x — then check your guess against the metrics you already collect.\n\n## Watch out\n\n- Estimate orders of magnitude, not decimals. \"About 70 req/s at peak\" is useful; \"68.4 req/s\" is false precision hiding your assumptions.\n- \"10x users\" is rarely \"10x load\". One account with an enormous follower count is a different curve, and traffic is spiky rather than smooth.\n- Retries without jitter create a thundering herd; retries without idempotency create duplicate charges and duplicate notifications. You need both.\n- Sharding early is the classic self-inflicted wound. Indexes, caches and replicas cover an enormous range, and every one of them is reversible.\n- A replica is not a backup and a cache is not a database. Either can be empty at any moment, and your code must still be correct when it is.",
+      "tasks": [
+        "Redo the 50,000 DAU estimate yourself on paper — peak requests/second, rows per month, media bytes per month — then write one sentence naming which of the three is the actual design problem.",
+        "Write the six-step method from memory, then apply it end to end to a feature you already built (the Task Manager task list) in under 20 minutes on a single page.",
+        "Find the in-memory state in one of your five projects (start with the chat-app-api rate limiter) and write the diff that would move it to Redis. You do not have to apply it.",
+        "Implement the backoff-with-jitter helper, print the computed delay for attempts 0 through 6, and run two copies at once to confirm they do not retry in lockstep.",
+        "List the single points of failure in one of your projects, and for each one decide what a degraded experience looks like instead of an error screen.",
+        "Write the read-your-own-writes problem up as a bug report: user action, replica lag, what the user sees, and the routing rule that fixes it."
+      ],
+      "quiz": [
+        {
+          "q": "50,000 daily active users, 6 app opens each, 4 requests per open. Average works out to roughly 14 req/s. What is the sane peak number to design against?",
+          "options": [
+            "About 14 req/s — averages are what matter",
+            "About 70 req/s — assume peak is a few times average",
+            "About 700 req/s — always design for 50x",
+            "About 1,400 req/s — assume everyone is active at once"
+          ],
+          "answer": 1,
+          "explain": "Traffic is spiky, and a 3–5x evening peak over the daily average is a normal working assumption. Designing for 50x wastes money; designing for the average guarantees a bad evening."
+        },
+        {
+          "q": "What has to be true before adding more API instances actually helps?",
+          "options": [
+            "The database has read replicas",
+            "Responses are cached in the CDN",
+            "The load balancer uses least-connections routing",
+            "The service is stateless, so any instance can serve any request"
+          ],
+          "answer": 3,
+          "explain": "Statelessness is the precondition for horizontal scaling. If a session, a rate-limit bucket or a presence map lives in one process's memory, the second instance disagrees with the first."
+        },
+        {
+          "q": "You add a read replica. A user posts, then immediately does not see their own post. What is the right fix?",
+          "options": [
+            "Route reads that follow a user's own write to the primary",
+            "Increase the cache TTL so the feed is served from Redis",
+            "Add an index on the posts table",
+            "Have the client retry the read after one second"
+          ],
+          "answer": 0,
+          "explain": "This is replication lag showing up as a correctness bug. Read-your-own-writes has to be routed to the primary; a client-side retry hides it sometimes and confuses everyone the rest of the time."
+        },
+        {
+          "q": "Which step of the database scaling ladder comes last, and is one most products never need?",
+          "options": [
+            "Read replicas",
+            "Partitioning",
+            "Sharding",
+            "Cache-aside with Redis"
+          ],
+          "answer": 2,
+          "explain": "Index, cache, replicas, partition, then shard. Sharding costs you cross-shard joins, transactions and easy uniqueness, and indexes plus caches plus replicas cover an enormous range first."
+        },
+        {
+          "q": "What problem does an idempotency key solve?",
+          "options": [
+            "It authenticates the caller without a token",
+            "It encrypts the request body in transit",
+            "It guarantees requests are processed in the order they were sent",
+            "It makes a retried request a no-op instead of a second side effect"
+          ],
+          "answer": 3,
+          "explain": "Queues and HTTP clients both retry, so delivery is at-least-once. A caller-supplied key lets the server recognise a repeat and return the original result rather than charging twice."
+        }
+      ],
+      "resources": [
+        {
+          "label": "roadmap.sh — System Design",
+          "url": "https://roadmap.sh/system-design"
+        },
+        {
+          "label": "roadmap.sh — Backend Performance Best Practices",
+          "url": "https://roadmap.sh/backend-performance-best-practices"
+        },
+        {
+          "label": "PostgreSQL — High Availability, Load Balancing, and Replication",
+          "url": "https://www.postgresql.org/docs/current/high-availability.html"
+        },
+        {
+          "label": "MDN — HTTP caching",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Caching"
+        }
+      ]
+    },
+    "m7-2": {
+      "content": "## The problem\n\nA user with a lot of followers posts something, and every one of those followers has a home screen that should show it within seconds. There are exactly two ways to make that happen, they have opposite cost profiles, and choosing wrong is very cheap on day one and very expensive to reverse in month nine.\n\nYou have felt the read-side version already: pull to refresh, spinner, four seconds, list finally paints. Behind that spinner is a query that gathered every post from every account you follow, ordered the union by time, computed like and comment counts, and threw away all but twenty rows. It was fast when you followed thirty people. Someone follows eight hundred and it is not. Today you design your product's two hardest features properly: the feed, and the chat.\n\n## The idea\n\nFan-out is one question: does the work happen at write time or at read time?\n\nThe mail analogy is exact. **Fan-out on write** is the postal service — when you send a letter, a copy lands in every recipient's mailbox, so checking your mail is trivial, but sending costs one delivery per recipient. **Fan-out on read** is walking to every sender's house to ask whether they wrote to you: sending is free, reading is a tour of the city.\n\nFeeds are read far more than written, so precomputing looks like the obvious winner — until one account has 100,000 followers and every post triggers 100,000 deliveries. That is the celebrity problem, and it is why the production answer is neither pure strategy.\n\n## In practice\n\n**Fan-out on read** is the query you would write first, with day 15's cursor:\n\n```sql\nSELECT p.id, p.author_id, p.body, p.created_at\nFROM posts p\nWHERE p.author_id IN (SELECT followee_id FROM follows WHERE follower_id = $1)\n  AND (p.created_at, p.id) < ($2, $3)   -- keyset cursor, never OFFSET\nORDER BY p.created_at DESC, p.id DESC\nLIMIT 20;\n```\n\nWrites cost one row. Reads scale with how many people you follow, and no index makes \"merge 800 sorted streams\" cheap.\n\n**Fan-out on write** flips it. A `timelines` table holds one row per recipient per post, and a job does the delivery:\n\n```ts\n// enqueued by the create-post route, executed by a worker\nexport async function fanOutPost(db: DbHandle, postId: string, authorId: string) {\n  const followers = await listFollowerIds(db, authorId);\n  for (const batch of chunk(followers, 1_000)) {\n    await insertTimelineRows(db, batch.map((userId) => ({ userId, postId })));\n  }\n}\n```\n\nThe read becomes a single index scan on `timelines (user_id, created_at DESC, post_id DESC)` — same cursor shape, one stream instead of eight hundred. Reads are trivially fast forever; the pain moved to writes.\n\n**The hybrid is the real answer.** Precompute for normal accounts; for the few high-fan-out accounts, skip delivery and merge them live at read time:\n\n```ts\nconst HIGH_FANOUT = 10_000;\n// on write: followerCount > HIGH_FANOUT means do not fan out at all\n// on read:  timeline rows  +  live query over the high-fanout accounts I follow\n```\n\nBounded write cost, and a read that touches one index plus a handful of author ids. Two more pieces make it practical: a **warmup job** that materialises a timeline in the background for a dormant user (nobody should pay to keep timelines warm for people who have not opened the app in a month), and running feed work on its **own queue** so a fan-out storm cannot starve password resets. Your work backend already runs a dedicated queue instance for feed jobs — that is not a codebase quirk, it is this design decision, already shipped.\n\n**Ranking versus chronological.** Chronological is a sort key. Ranking is two steps: fetch a candidate set (the last few hundred timeline rows), score, return twenty. Keep the timeline chronological and rank at read time, because a stored rank goes stale as soon as engagement moves. Ranked feeds also break naive cursors — a score change can move a row you already sent — so paginate over a snapshot: seed the ranking per session and page by position within that seed.\n\n**Invalidation.** When a post is deleted or its author gets blocked, purging 100,000 timeline rows is another write storm. Do not. Filter at read time — join timelines to `posts`, drop rows whose post is gone or whose author the reader blocked — and let a slow cleanup job reclaim space later. Treat timeline rows as a cache of pointers, not as truth.\n\n**Unread counts.** `SELECT count(*) FROM notifications WHERE user_id = $1 AND read_at IS NULL` on every app open is a scaling bomb: it scans everything the user ever received, and it runs more often than any other query in the product. Two fixes, in ladder order — partial index first:\n\n```sql\nCREATE INDEX notifications_unread_idx ON notifications (user_id)\n  WHERE read_at IS NULL;   -- indexes only unread rows: small, hot, cheap\n```\n\nThen a counter column updated in the same transaction as the insert, making the read O(1) at the cost of a value that can drift. Counters need a reconcile job, and the count becomes eventually consistent with the list.\n\n**Push idempotency.** Delivery is at-least-once, so the same notification can arrive twice — and a double buzz reads as a bug in your product regardless of whose fault it was. Give every notification a stable id and make delivery keyed per notification per device, so a retry is a no-op.\n\n**Chat across instances.** A socket lives on exactly one process. A is connected to instance 1, B to instance 2, and A sends a message — instance 1 has no socket for B. So instances talk: write to Postgres, publish to a channel, and whichever instance holds B's socket delivers it.\n\n```ts\nawait saveMessage(db, msg);                          // durable, first\nawait pub.publish(`conversation:${msg.conversationId}`, JSON.stringify(msg));\n// every instance subscribes; the one holding the socket writes to it\n```\n\nOrder matters: persist first, publish second. Pub/sub is at-most-once — if B's phone is asleep the broadcast vanishes, and the database is the only fallback.\n\n**Ordering.** Timestamps are a bad sort key for chat: clocks skew between servers, and two messages in the same millisecond have no defined order, so the list shuffles between refreshes. Allocate a per-conversation sequence number in the same transaction as the insert, so `seq` is dense, monotonic and unique inside the conversation. Nobody needs global ordering across conversations; everybody notices broken ordering inside one.\n\n**Receipts and offline sync.** A delivered/read row per message per participant makes receipts your highest-write table by an order of magnitude. Store a high-water mark instead: one row per conversation per participant holding the last `seq` they saw. A read receipt becomes one UPDATE, and \"unread here\" becomes arithmetic.\n\nThat mark is also your sync cursor. The client reconnects after three hours and must not reload everything:\n\n```sql\nSELECT * FROM messages\nWHERE conversation_id = $1 AND seq > $2\nORDER BY seq LIMIT 500;    -- $2 = last seq the client actually stored\n```\n\nIf the gap exceeds your window, return a resync signal and let the client fetch a fresh page. Bounded work either way.\n\n## In your world\n\nThis is the design layer over things you already built. Day 15's cursor pagination is the feed read path. The chat core from days 16 and 17 is the pub/sub problem, and the presence state you deliberately kept ephemeral is the same \"socket lives on one process\" fact seen from the other side. Day 18's worker is the fan-out executor. None of the machinery is new; being able to say why each piece is shaped that way is.\n\nSpend an hour reading your work backend's feed code as a design rather than as code. Find where timelines get built, what triggers the build, which queue the job goes on, and what happens at read time to a post that no longer exists. Then write the one-page version: requirements, estimate, data model, components, bottleneck, trade-offs. That page — not the diff — is what a tech lead produces before the work starts.\n\n## Watch out\n\n- Fan-out on write makes deletes, blocks and privacy changes expensive. Every timeline row is a copy you now have to reason about.\n- Ranked feeds and cursor pagination do not compose for free. Without a snapshot you ship duplicate and vanishing items — the bug you have already seen from the client side.\n- Counters drift. Ship a reconcile job with them, or your unread badge will eventually lie, and users trust the badge more than the list.\n- Pub/sub is not delivery. If the write and the broadcast are not both handled, an offline user silently loses the message.\n- Timestamps as ordering keys look fine on one machine in testing. They come apart under clock skew and same-millisecond writes, exactly when you cannot reproduce it.",
+      "tasks": [
+        "Write both feed queries against a scratch schema — the fan-out-on-read join and the fan-out-on-write timeline scan — and compare EXPLAIN ANALYZE for each with a few thousand posts seeded.",
+        "Draw the hybrid feed on one page: the follower-count threshold, what the write path does above and below it, and exactly what the read path merges.",
+        "Add the partial index for unread notifications to one of your projects and record EXPLAIN ANALYZE for the unread count before and after.",
+        "Write the SQL that allocates a per-conversation sequence number and inserts the message in one transaction, then explain what happens with two concurrent senders.",
+        "Specify the offline-sync endpoint: request parameters, response shape, page size, and the resync signal for when the client's gap is too large.",
+        "Read your work backend's feed job as a design: what enqueues it, which queue instance it runs on, and what the read path does with a post that no longer exists. Three sentences each."
+      ],
+      "quiz": [
+        {
+          "q": "Pure fan-out on write. An account with 100,000 followers publishes one post. How many rows does that write?",
+          "options": [
+            "One — the post row",
+            "Twenty — one per follower currently online",
+            "Roughly 100,000 — one timeline row per follower, plus the post",
+            "It depends on how many followers open the app that day"
+          ],
+          "answer": 2,
+          "explain": "Fan-out on write pays at publish time regardless of who reads. That write amplification is set by your most-followed account, which is why pure fan-out on write has a celebrity problem."
+        },
+        {
+          "q": "In a hybrid feed, what happens when a very high-fan-out account posts?",
+          "options": [
+            "Skip fan-out entirely and merge that author's posts live at read time",
+            "Fan out to all followers, but overnight in small batches",
+            "Push the post into the CDN so followers read it from the edge",
+            "Shard the timelines table by follower id"
+          ],
+          "answer": 0,
+          "explain": "The hybrid bounds write cost by not delivering for the few accounts that would cause a storm. Their posts get merged in at read time, which is cheap because there are only a handful of such authors."
+        },
+        {
+          "q": "A post is deleted, and it sits in 100,000 precomputed timelines. What is the cheap correct move?",
+          "options": [
+            "Delete all matching timeline rows immediately so reads stay simple",
+            "Purge the CDN cache for that post id",
+            "Recompute every affected timeline from scratch",
+            "Filter at read time by joining to posts, and let a slow cleanup job reclaim space later"
+          ],
+          "answer": 3,
+          "explain": "Deleting 100,000 rows synchronously is a second write storm. Treat timeline rows as a cache of pointers: filter on read for visibility, and reclaim space lazily."
+        },
+        {
+          "q": "Why use a per-conversation sequence number instead of created_at for message ordering?",
+          "options": [
+            "Integers use less storage than timestamps",
+            "Clock skew between servers and same-millisecond writes leave the order undefined, so the list shuffles",
+            "It gives you a global ordering across every conversation",
+            "It lets you drop the index on the messages table"
+          ],
+          "answer": 1,
+          "explain": "Timestamps are not a total order: two messages can share a millisecond, and different servers disagree about now. A sequence allocated per conversation in the insert transaction is dense, monotonic and unique where it matters."
+        },
+        {
+          "q": "User A's socket is on instance 1, user B's on instance 2. A sends B a message. What makes delivery work?",
+          "options": [
+            "Sticky sessions that pin both users to the same instance",
+            "A longer WebSocket timeout so the socket survives until B reconnects",
+            "Persist the message, then publish on a channel every instance subscribes to — with the database as the fallback for offline users",
+            "Routing at the load balancer by user id so conversations land on one instance"
+          ],
+          "answer": 2,
+          "explain": "A socket lives on exactly one process, so instances need pub/sub to reach each other. Persist first: pub/sub is at-most-once, so an offline user's message has to be recoverable from the database."
+        }
+      ],
+      "resources": [
+        {
+          "label": "roadmap.sh — System Design",
+          "url": "https://roadmap.sh/system-design"
+        },
+        {
+          "label": "PostgreSQL — Partial Indexes",
+          "url": "https://www.postgresql.org/docs/current/indexes-partial.html"
+        },
+        {
+          "label": "Supabase — Realtime",
+          "url": "https://supabase.com/docs/guides/realtime"
+        },
+        {
+          "label": "Redis documentation",
+          "url": "https://redis.io/docs/latest/"
+        }
+      ],
+      "trap": {
+        "title": "Sketch the write storm, then count it",
+        "content": "Sketch the feed with fan-out on write and nothing else. Draw the boxes: create-post route inserts into `posts`, enqueues a fan-out job, worker inserts one `timelines` row per follower. It is a clean design and it is the one most people reach for first. Now estimate it on paper before you believe it.\n\nOne post from an account with 100,000 followers:\n\n- 100,001 rows written for one tap of a button\n- batched a thousand at a time, 100 round trips and roughly 100,000 index entries added to `timelines`\n- every one of those rows goes to the write-ahead log first, so at around 120 bytes per row that is roughly 12 MB of WAL from a single post\n- ten such accounts posting in the same minute is a million inserts, sharing one connection pool with every login, every chat message and every unread-count query\n\nThen measure instead of imagining. Seed a `follows` table with 100,000 rows pointing at one author, run your fan-out locally with `\\timing on`, and write down the wall clock. Two questions you cannot answer without that number: how long until a follower actually sees the post — which is your product's latency, not your query's — and what else was queued behind those writes while it happened.\n\nThe point is not that fan-out on write is wrong. The point is that it does not fail loudly. It quietly becomes the largest write workload in your system, on a growth curve set by your single most-followed user rather than by your user count. You cannot feel that from reading about it. You can feel it from one number you measured yourself."
+      }
+    },
+    "m7-3": {
+      "content": "## The problem\n\nDay 45. Your mentor hands you one more piece of work, and it is not a feature. Somewhere in the codebase a service reaches for the privileged database handle directly instead of taking the request-scoped one from its caller. Nothing about it looks broken: the endpoint returns data, the tests pass, no error has ever appeared in the dashboards. But the privileged pool is precisely the handle that bypasses row-level security, so for those queries the policies you learned to write never ran at all. The only thing keeping one user out of another user's rows was whatever `WHERE` clause the service happened to include.\n\nThat is a security bug with no symptom, which is the worst kind. It pages nobody. It waits for the day someone edits a filter or adds a call site that forgets one, and then a curious user with a valid token and a guessable id sees data that was never theirs. Your mentor will point you at a real instance. Your job is to fix it, prove the fix, and get every line reviewed before it ships.\n\n## The idea\n\nThis is the right capstone for three reasons, and it is worth knowing why rather than just doing it.\n\nIt is **small** — a handful of signatures and their call sites, no migration, no new dependency. It is **genuinely needed**, so the review will be real and the merge will matter. And it is **impossible to finish without having internalised the difference** between a request-scoped handle and a privileged one: if day 32 did not land, you cannot tell which call sites are bugs and which are correct, because job handlers use the privileged pool on purpose. There is no faking your way through this diff.\n\nIt is also what most real security work looks like. Not exotic exploits — boring plumbing that quietly grants more access than intended, found by someone who read an import line carefully.\n\n## In practice\n\n**First, read the import.** Not the ticket, not your mentor's description, not this page. The file. Find every service that pulls a pool in for itself rather than receiving a handle:\n\n```bash\nrg \"db/pools\" src/services   # then read each hit and decide: bug, or a job handler?\n```\n\nSort the hits into two piles. Request-path services are bugs. Job handlers are not — a background worker has no request and no user, so the privileged pool is the correct tool there. Getting this classification right is the entire skill being tested.\n\n**Then change the signature**, following the convention the codebase already uses everywhere else: `db` is the first parameter.\n\n```ts\n// before — the service decides for itself, and RLS is silently out of the picture\nimport { db } from \"../db/pools\";\nexport async function listItemsForOwner(ownerId: string) { /* ... */ }\n```\n\n```ts\n// after — the caller decides, and the caller has a request\nexport async function listItemsForOwner(db: DbHandle, ownerId: string) { /* ... */ }\n```\n\nThe route passes the handle it already has:\n\n```ts\nconst db = c.get(\"db\");   // request-scoped: queries run as the caller, policies apply\nconst items = await listItemsForOwner(db, user.id);\n```\n\nThat is the whole fix, mechanically. Which is exactly why the test matters more than the diff.\n\n**Write a test that proves it.** Shape the request so that it can only pass if another user's data leaked:\n\n```ts\ntest(\"user A cannot read user B's row through this route\", async () => {\n  const row = await seedRowOwnedBy(userB);\n\n  const leak = await request(`/items/${row.id}`, { as: userA });\n  expect(leak.status).toBe(404);            // not 200, and not 500 either\n\n  const owner = await request(`/items/${row.id}`, { as: userB });\n  expect(owner.status).toBe(200);           // positive control: the route still works\n});\n```\n\nThe positive control is not optional. Without it, your leak test passes just as happily against a route that returns 404 for everybody, and you will have proven nothing while feeling good about it.\n\nThen do the step most people skip: **watch the test fail**. Stash the fix, run the test against the old code, see it go red on the 404 assertion, restore the fix, see it go green. A test you have only ever seen pass is a decoration. A test you have seen fail for the right reason is a proof.\n\n## In your world\n\nShip it the way your team ships: branch from `dev`, a `[FIX]` prefix on the commit and PR title, a diff small enough to read in one sitting. In the PR description say which services changed, that they now receive the request-scoped handle from the route, and that job handlers were deliberately left alone. If you found other instances of the pattern, they go in that description as a list — not in this diff. Your mentor reviews every line, it verifies on the dev environment, and it reaches production through the normal release branch. No hotfix path, even for a security fix, because the pipeline is what makes the fix trustworthy.\n\n### Where next\n\nThe honest map, now that the 45 days are behind you:\n\n- **The side quests you skipped.** The mentor's full four-week ramp is the deepest one. Stripe end-to-end, the project tracker's production patterns, and a real AWS deploy are the three that most change what you can be handed at work. Pick by what next quarter needs, not by curiosity.\n- **Depth paths.** Postgres internals (MVCC, vacuum, the planner) pay off forever in a Postgres shop. Distributed systems — consensus, why exactly-once delivery is a marketing claim — makes you calm in design meetings. Kubernetes only when your team actually adopts it; learning it before then is a hobby, not leverage.\n- **The tech-lead skills that are not code.** Reviewing someone else's PR by asking questions instead of pushing your own patch. Writing the one-page design doc from yesterday before the work starts. Sizing work honestly, including the parts you have not thought about yet. And being the person who says \"not yet\" with a reason attached — which is the hardest one and the most valuable.\n\n## Watch out\n\n- Never trust a bug description, including a friendly one. Read the import line and the call sites yourself. Descriptions rot; imports do not.\n- Do not \"fix\" an RLS bypass by adding a `WHERE` clause. That is day 13's lesson: remembering the filter is not a security model. Pass the handle that enforces it.\n- Job handlers legitimately use the privileged pool. Converting them because a script told you to is how you break the queue in the name of security.\n- Scope creep will present itself as diligence. Other instances, better naming, a nearby refactor — list them, do not ship them here. Small diffs get reviewed carefully; large ones get approved.\n\n## Checkpoint\n\nNo notes. Out loud. If an answer takes longer than two minutes, that is the topic to revisit.\n\n1. Walk through every PR you shipped in this expedition, one at a time, line by line — including the lines you copied from an existing pattern. Any line you cannot justify is a line you do not own.\n2. Why does the privileged-pool fix matter? Describe concretely what a curious user holding a valid token could have seen before it, how they would have found it, and what stops them now.\n3. You wrote an RLS policy. How did you *prove* it blocks another user rather than trusting that the SQL reads correctly? What would count as proof to a reviewer who does not trust you?\n4. Which of the codebase's known traps surprised you most — the twin queues, append-only migrations, the two pools, the silent schema rename? What would have happened in production if you had not known it, and how long would anyone have taken to notice?\n5. Explain what happens between the moment your PR merges and the moment the new code serves a real request. Name every automated step, and which of them can fail silently.\n6. Pick something you still do not understand and describe it precisely enough that someone could teach it to you in an hour. Naming the edge of your own knowledge accurately is the skill being tested here, not confidence.\n\n---\n\nForty-five days makes you dangerous and useful. It does not make you finished, and anyone who tells you otherwise is selling a course. You can now design a system, defend the trade-offs, find the slow query, ship the migration, and prove the security fix — which is more than a lot of people with backend in their title can do. The rest arrives the slow way. The difference between a competent backend engineer and a good one is mostly how many production incidents they have been calm during, and you cannot study for those. You can only be ready, and now you are.",
+      "tasks": [
+        "Search the services directory for direct pool imports and sort every hit into two piles — request-path bug, or legitimate job handler. Show the list to your mentor before you change a line.",
+        "Change the flagged services to take the db handle as their first parameter, and update every call site so the route passes its request-scoped handle.",
+        "Write the cross-user leak test with a positive control, then stash the fix, watch the test go red for the right reason, and restore it.",
+        "Open the PR into dev with a [FIX] prefix, stating which services changed, that job handlers were deliberately left alone, and listing any other instances you found but did not touch.",
+        "Answer all six checkpoint questions out loud with no notes, ideally to your mentor, and write down every question that took you more than two minutes.",
+        "Commit to your next two things: one skipped side quest and one depth path, each with a date."
+      ],
+      "quiz": [
+        {
+          "q": "Why is a service using the privileged database handle in the request path a security bug rather than a style issue?",
+          "options": [
+            "The privileged pool is slower under load",
+            "It cannot participate in transactions",
+            "It only works inside job handlers and will throw at runtime",
+            "It bypasses row-level security, so your policies never run for those queries"
+          ],
+          "answer": 3,
+          "explain": "The privileged handle exists to bypass RLS for background work. Used in a request, the only thing separating users is whatever WHERE clause the service happens to include."
+        },
+        {
+          "q": "What is the correct shape of the fix?",
+          "options": [
+            "Add a defensive WHERE clause to every query in the service",
+            "Have the service accept the db handle as a parameter, passed in by the route from the request context",
+            "Wrap the service calls in try/catch and log unauthorised access",
+            "Move the service into a job handler where privileged access is expected"
+          ],
+          "answer": 1,
+          "explain": "Remembering the filter is not a security model — that was day 13. Passing the request-scoped handle makes the database enforce the rule for every query, including the ones written next year."
+        },
+        {
+          "q": "Why does the leak test need a positive control — the same request made as the owner, expecting success?",
+          "options": [
+            "Because a leak test passes just as happily against a route that returns 404 for everybody",
+            "To measure the endpoint's latency for both users",
+            "Because coverage thresholds require two assertions per test",
+            "To verify the test database connection is alive"
+          ],
+          "answer": 0,
+          "explain": "Without the positive control, a totally broken route makes your security test green. The pair of assertions proves both that the data is reachable and that it is only reachable by its owner."
+        },
+        {
+          "q": "What actually makes you believe the new test proves the fix?",
+          "options": [
+            "It passes in CI on the first run",
+            "It contains at least three assertions",
+            "You watched it fail against the unfixed code, on the assertion you expected, before it passed",
+            "Your mentor approved the pull request"
+          ],
+          "answer": 2,
+          "explain": "A test you have only seen pass is a decoration; it might assert nothing. Seeing it go red for the right reason and then green is the only evidence that it can detect the bug."
+        },
+        {
+          "q": "Which call sites legitimately use the privileged pool?",
+          "options": [
+            "Routes that need to read data across users, like an admin list",
+            "Background job handlers, which have no request and no acting user",
+            "Any read-only endpoint, since reads cannot cause damage",
+            "Anything mounted as a public route"
+          ],
+          "answer": 1,
+          "explain": "A worker runs with no request context, so there is no user for RLS to scope to and the privileged handle is correct. Converting job handlers in the name of security just breaks the queue."
+        }
+      ],
+      "resources": [
+        {
+          "label": "PostgreSQL — Row Security Policies",
+          "url": "https://www.postgresql.org/docs/current/ddl-rowsecurity.html"
+        },
+        {
+          "label": "Supabase — Row Level Security",
+          "url": "https://supabase.com/docs/guides/database/postgres/row-level-security"
+        },
+        {
+          "label": "roadmap.sh — API Security Best Practices",
+          "url": "https://roadmap.sh/api-security-best-practices"
+        },
+        {
+          "label": "roadmap.sh — Backend",
+          "url": "https://roadmap.sh/backend"
+        }
+      ]
+    },
+    "sq-11": {
+      "content": "## The problem\n\nReading someone else's design is like watching someone else lift. You follow every step, agree with all of it, and learn almost nothing you can reuse. The skill only forms when you are the one staring at requirements that contradict each other.\n\n## The idea\n\nThree workouts, thirty minutes each. For each, produce one page in the shape from day 43: requirements, estimate, data model, components, bottleneck, trade-offs. There are deliberately **no solutions** here — a solution page turns designing back into reading. The hints point at the tension, not the answer.\n\n## In practice\n\n### 1. Media processing pipeline\n\nA user uploads a 200MB video from a phone on flaky mobile data. You owe them a thumbnail, three renditions, and playback within two minutes, served through a CDN.\n\n- Where do the bytes actually land, and does the upload request touch your API at all?\n- A job per video or a job per rendition — what does each choice do to retries?\n- What is the idempotency key when the same asset gets transcoded twice?\n- What does the client watch while it waits, and what does it show at 99%?\n- Someone re-encodes an existing asset. What is the CDN cache key, and who purges it?\n\n### 2. Push notification system\n\nOne event fans out to many users, each with several devices. Quiet hours are per-user and per-timezone, and nobody may get the same buzz twice.\n\n- Estimate first: 50,000 recipients averaging 1.8 devices. How many provider calls, at what rate limit?\n- A provider says a token is dead. Where is that recorded, and when do you stop trying?\n- Forty likes in ten minutes should be one notification. Where does that collapsing happen, and what does it cost in latency?\n- Quiet hours: drop, delay, or batch into the morning? Each has a product consequence — name it.\n- What is the dedupe key, and which component is allowed to retry?\n\n### 3. Offline-first sync\n\nThe app is edited offline for hours on two devices, then both reconnect. Deletes must not resurrect; edits must not silently vanish.\n\n- What does the client send to ask \"what changed since I synced\", and what does the server key that on, given client clocks lie?\n- Last-write-wins is one line of code and loses data quietly. Which fields can you afford to lose that way?\n- Where would a plain counter or a CRDT beat LWW, and what does it cost in storage?\n- Deletes need tombstones. How long do you keep them, and what must a device that syncs later do?\n\n## In your world\n\nExercise one is file-vault-api's pipeline with the volume turned up: same presigned upload, same worker, harder constraints. Exercise two is the notification path in any social product, including the one you work on. Exercise three is the problem your mobile app already half-solves — write it from the server side and notice how many decisions the client has been making alone.\n\n## Watch out\n\n- Estimate before you draw. A design without a number is a preference.\n- Name exactly one bottleneck per exercise. If everything is a bottleneck, nothing was analysed.\n- Do not design for 100x. Design for your real scale and say where it breaks.\n- Show a page to your mentor. Being questioned about a trade-off you chose is the actual exercise.",
+      "tasks": [
+        "Set a 30-minute timer per exercise and produce one page each: requirements, estimate, data model, components, bottleneck, trade-offs.",
+        "For the media pipeline, write the asset status state machine explicitly — every state and every allowed transition.",
+        "For push notifications, estimate the provider calls for a 50,000-recipient event, then write one sentence per quiet-hours policy you rejected explaining why.",
+        "For offline sync, write the tombstone retention rule and describe what a device that syncs after that window has to do.",
+        "Show one of the three pages to your mentor and defend a trade-off you chose out loud."
+      ],
+      "quiz": [
+        {
+          "q": "Two devices edit the same record offline. What is the real cost of last-write-wins?",
+          "options": [
+            "It silently discards a concurrent edit, with no signal to the user or to you",
+            "It needs more storage than a conflict log",
+            "It makes tombstones unnecessary",
+            "It requires a CRDT library on the client"
+          ],
+          "answer": 0,
+          "explain": "LWW is one line of code and always resolves, which is exactly the danger: the losing edit disappears without an error. Decide per field whether you can afford that."
+        },
+        {
+          "q": "Why does an offline-sync design need tombstone rows?",
+          "options": [
+            "To compress deleted rows and reclaim disk",
+            "To keep foreign keys valid after a delete",
+            "So a client syncing later learns about the delete instead of re-uploading the row and resurrecting it",
+            "To make unread counts cheaper to compute"
+          ],
+          "answer": 2,
+          "explain": "A hard delete is invisible to a changed-since query — the row is simply absent, which a client cannot distinguish from never having existed. Tombstones make deletion a change the client can sync."
+        },
+        {
+          "q": "In the media pipeline, where should a 200MB upload from a phone actually land?",
+          "options": [
+            "Through your API so it can validate the file before storing it",
+            "Directly in object storage via a presigned URL, with your API only recording the asset",
+            "Through the CDN, which forwards to storage",
+            "In the job queue payload, so the worker has the bytes"
+          ],
+          "answer": 1,
+          "explain": "Streaming 200MB through your API burns a process, a connection and your bandwidth for zero benefit. Presign the upload, then validate and transcode from storage in a job."
+        }
+      ],
+      "resources": [
+        {
+          "label": "roadmap.sh — System Design",
+          "url": "https://roadmap.sh/system-design"
+        },
+        {
+          "label": "Supabase — Storage",
+          "url": "https://supabase.com/docs/guides/storage"
+        },
+        {
+          "label": "AWS S3 — Using presigned URLs",
+          "url": "https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html"
+        }
+      ]
+    },
+    "sq-12": {
+      "content": "## The problem\n\n\"It feels fast\" is an opinion, and opinions lose arguments to numbers. Worse, they lose to reality: the endpoint that felt fast with one user on localhost falls over at forty concurrent users, and you find out on a launch day rather than a Tuesday afternoon. A number you measured beats an opinion you had, every single time.\n\n## The idea\n\nA load test is a measuring instrument, not a verdict. You define virtual users, ramp them until something bends, and read the shape of the bend. The averages are useless — a mean of 90ms can hide one in twenty users waiting four seconds. Read percentiles: p95 is roughly the experience of your unluckiest regular user, and it is the number to argue about.\n\nk6 is a good instrument because the test runner itself is fast enough not to become the bottleneck you accidentally measure.\n\n## In practice\n\nWrite a script against your Task Manager API that logs in once and then hammers the list endpoint:\n\n```js\nimport http from \"k6/http\";\nimport { check } from \"k6\";\n\nexport const options = {\n  stages: [\n    { duration: \"30s\", target: 10 },   // warm\n    { duration: \"1m\",  target: 100 },\n    { duration: \"1m\",  target: 300 },\n    { duration: \"1m\",  target: 600 },  // keep ramping until it bends\n  ],\n  thresholds: { http_req_failed: [\"rate<0.01\"], http_req_duration: [\"p(95)<400\"] },\n};\n\nexport default function () {\n  const res = http.get(`${__ENV.API}/tasks?limit=20`, {\n    headers: { Authorization: `Bearer ${__ENV.TOKEN}` },\n  });\n  check(res, { \"200\": (r) => r.status === 200 });\n}\n```\n\nSeed a realistic dataset first — ten rows never breaks. Ten thousand tasks across a hundred users does.\n\nThen read the breakage, because its shape names the cause:\n\n- **Latency climbs while throughput flatlines** — saturation. Something downstream is serialising your requests.\n- **Errors appear suddenly at a specific VU count** — a pool or a limit. Connection pool exhausted, file descriptors, provider rate limit.\n- **p50 stays flat while p95 explodes** — queueing behind a few slow requests.\n\nThe first bottleneck is almost always one of two things. A missing index: confirm with `EXPLAIN ANALYZE` on the query the endpoint runs, look for a sequential scan over the whole table. Or the connection pool: a pool of ten with 300 virtual users means 290 of them are waiting on a checkout, and the wait shows up as latency you will hunt for in the wrong place.\n\nFix one thing. Re-run the identical script. Record both runs:\n\n| Run | p50 | p95 | req/s | error rate |\n|---|---|---|---|---|\n| baseline | | | | |\n| after fix | | | | |\n\nThat table is the deliverable. It is also the format that ends design arguments.\n\n## In your world\n\nDo this on task-manager-api first, where you own every line and can break it freely. Then look at your work backend's real dashboards with new eyes: you now know that p95 is the number that matters, that a flat p50 with a rising p95 means queueing, and that \"the app feels slow\" is a hypothesis you can test rather than a complaint you absorb.\n\n## Watch out\n\n- Never load test production. You will page someone, and the numbers will be contaminated by real traffic anyway.\n- An empty database is not a test subject. Seed to a realistic size and shape or you measure nothing.\n- If your laptop is at 100% CPU, you are measuring your laptop. Watch the runner's own resource use.\n- Change one variable per run. Two fixes at once and you have learned which one worked: neither, provably.",
+      "tasks": [
+        "Install k6 and run the ramping script against your local Task Manager API with at least 10,000 tasks seeded across a hundred users.",
+        "Ramp until the failure rate crosses 1% or p95 crosses 400ms, and write down the virtual-user count where the curve bent.",
+        "Diagnose the first bottleneck: run EXPLAIN ANALYZE on the endpoint's query, and compare your connection pool size against the virtual-user count.",
+        "Apply exactly one fix, re-run the identical script, and fill in the before/after table with p50, p95, throughput and error rate.",
+        "Write three sentences on what you expected to break versus what actually broke."
+      ],
+      "quiz": [
+        {
+          "q": "Which latency number is worth arguing about in a load test?",
+          "options": [
+            "The mean response time",
+            "Total requests completed",
+            "p95",
+            "The single slowest request"
+          ],
+          "answer": 2,
+          "explain": "A mean of 90ms can hide one user in twenty waiting four seconds. p95 is roughly your unluckiest regular user, and the max is usually one unrepresentable outlier."
+        },
+        {
+          "q": "Errors appear suddenly once you cross a specific virtual-user count, rather than climbing gradually. What does that shape suggest?",
+          "options": [
+            "A pool or hard limit being exhausted — connections, file descriptors, or a provider rate limit",
+            "A missing index on the queried table",
+            "A slow network between the load generator and the API",
+            "Garbage collection pauses in the runtime"
+          ],
+          "answer": 0,
+          "explain": "Missing indexes make latency climb smoothly with load. A cliff at a specific concurrency is a fixed-size resource running out, and the connection pool is the usual suspect."
+        },
+        {
+          "q": "Why must you seed a realistic dataset before load testing?",
+          "options": [
+            "k6 refuses to run against an empty database",
+            "A sequential scan over ten rows is instant, so you measure nothing that will happen in production",
+            "It is the only way to test authentication under load",
+            "It warms the CDN cache"
+          ],
+          "answer": 1,
+          "explain": "Query plans and costs depend on data volume. Against a tiny table, Postgres happily scans everything in microseconds and the missing index you are hunting stays invisible."
+        }
+      ],
+      "resources": [
+        {
+          "label": "k6 documentation",
+          "url": "https://grafana.com/docs/k6/latest/"
+        },
+        {
+          "label": "PostgreSQL — Using EXPLAIN",
+          "url": "https://www.postgresql.org/docs/current/using-explain.html"
+        },
+        {
+          "label": "roadmap.sh — Backend Performance Best Practices",
+          "url": "https://roadmap.sh/backend-performance-best-practices"
+        }
+      ]
+    }
+  }
+}

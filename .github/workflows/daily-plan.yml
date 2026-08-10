@@ -1,0 +1,42 @@
+name: Daily plan
+
+# Posts the module that's due each morning to the pinned "Daily Plan" issue.
+# The comment @mentions the repo owner, so GitHub notifies you — install the
+# GitHub mobile app and it arrives as a push notification.
+
+on:
+  schedule:
+    # 01:30 UTC = 07:00 IST. GitHub's scheduler can lag by a few minutes.
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print the plan instead of posting it"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: daily-plan
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Compute and post today's plan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          NTFY_TOPIC: ${{ vars.NTFY_TOPIC }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+        run: node scripts/daily-plan.mjs

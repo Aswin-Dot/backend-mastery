@@ -1,0 +1,244 @@
+{
+  "phaseId": "p45",
+  "modules": {
+    "m45-1": {
+      "content": "## The problem\n\nYour Task Manager grew. Forty routes now: tasks, categories, auth, attachments, comments, reminders, exports. `app.ts` is three hundred lines of `app.use(...)` in an order nobody dares touch, because someone once moved the auth middleware two lines up and uploads broke for a day.\n\nThen two things land in the same week. A teammate adds `formatDueDate` to `utils/date.ts` — the second copy of a function that already lives in `services/task.service.ts`, with a different timezone bug. And you sit down to unit-test `listTasks` and can't, because the service file imports the Supabase client at the top. The instant Jest loads that module it wants real credentials and a real network. Your \"unit test\" boots the whole app, takes nine seconds, and fails on CI because there's no `.env`.\n\nNeither of those is a bug you can point at in a stack trace. They are the bill for total freedom, arriving late.\n\n## The idea\n\nLook closely at why that service is untestable. It never *receives* the client — it *reaches out and takes one*:\n\n```ts\n// services/task.service.ts — the service constructs its own world\nimport { supabase } from \"../config/supabase\";\n\nexport async function listTasks(userId: string) {\n  return supabase.from(\"tasks\").select(\"*\").eq(\"user_id\", userId);\n}\n```\n\nDependency injection turns that around. A class **declares** what it needs, as constructor parameters, and something else decides what to hand it. That something else is the DI container. Two things fall out immediately: you can hand it a fake in a test, and you can hand it a different real thing in production without touching the file.\n\nThe second idea is modules, and you already do this on mobile. A well-factored React Native feature folder has its own navigator, its own hooks, and an `index.ts` that exports the three things other features are allowed to import — plus a review comment when someone deep-imports past it. Nest gives the backend that exact shape, and enforces it at boot instead of in review: if `RemindersModule` doesn't import `TasksModule`, and `TasksModule` doesn't list `TasksService` in `exports`, then injecting it fails when the process starts. Not at 2am under load. At startup, with a message naming the missing dependency.\n\nMost of the vocabulary is a rename of what you already built by hand:\n\n| What you wrote in Express | What Nest calls it |\n|---|---|\n| `routes/tasks.ts` | controller |\n| `services/task.service.ts` | provider |\n| the wiring in `app.ts` | module |\n| `requireAuth` middleware | guard |\n| `taskSchema.parse(req.body)` | pipe |\n| error-handling middleware | exception filter |\n\n## In practice\n\nA module is a declaration of four lists: what it needs, what it serves over HTTP, what it can inject, and what it lets others inject.\n\n```ts\n// tasks/tasks.module.ts\n@Module({\n  imports: [SupabaseModule],        // dependencies I need\n  controllers: [TasksController],   // HTTP surface I expose\n  providers: [TasksService],        // injectables I own\n  exports: [TasksService],          // my public API to other modules\n})\nexport class TasksModule {}\n```\n\nThe controller does exactly what your route file did, minus the plumbing. Decorators replace the router calls, and parameter decorators replace reaching into `req`:\n\n```ts\n@Controller(\"tasks\")\nexport class TasksController {\n  constructor(private readonly tasks: TasksService) {}\n\n  @Get(\":id\")\n  async findOne(@Param(\"id\") id: string, @CurrentUser() user: AuthUser) {\n    return this.tasks.findOne(user.id, id);\n  }\n\n  @Post()\n  async create(@Body() dto: CreateTaskDto, @CurrentUser() user: AuthUser) {\n    return this.tasks.create(user.id, dto);\n  }\n}\n```\n\nNote what is *absent*: no try/catch, no `res.status(...)`, no manual validation call. Those become filters and pipes, which is day 29.\n\nThe service is a plain class with a decorator and a constructor that asks for things:\n\n```ts\n@Injectable()\nexport class TasksService {\n  constructor(private readonly db: SupabaseClientProvider) {}\n\n  async findOne(userId: string, id: string) {\n    const task = await this.db.forUser(userId).from(\"tasks\").selectOne(id);\n    if (!task) throw new NotFoundException(\"Task not found\");\n    return task;\n  }\n}\n```\n\nAt boot, Nest walks that graph. `TasksController` needs `TasksService`; `TasksService` needs `SupabaseClientProvider`, which `SupabaseModule` exports. It constructs each one **once** and hands the same instance to everyone. If a link is missing you get the error you will see most often in your first week:\n\n```text\nNest can't resolve dependencies of the TasksService (?).\nPlease make sure that the argument at index [0] is available in the TasksModule context.\n```\n\nRead the `?`. It marks which constructor argument the container couldn't satisfy — you either forgot to list the provider, or forgot to import (or export) the module that owns it.\n\nHow does Nest know the constructor wants a `SupabaseClientProvider` at runtime, when TypeScript types are erased? Because `emitDecoratorMetadata` in `tsconfig.json` makes the compiler write the parameter types into metadata, and `reflect-metadata` lets Nest read them back. That is the whole magic trick, and it's why a broken tsconfig produces bizarre injection failures.\n\nLet the CLI write the boilerplate: `nest g resource tasks` scaffolds module, controller, service, DTOs, and a spec file, then wires the module into `app.module.ts` for you.\n\n## In your world\n\nDon't rewrite the whole Task Manager today. Take **one** slice — the tasks resource — into a fresh `nest new` app and port `GET /tasks`, `GET /tasks/:id`, and `POST /tasks`. Keep the same Supabase project, the same tables. What you're measuring is not \"did it work\" but the trade: more ceremony per endpoint (a controller, a service, a module, a DTO where you had one handler), and far less wiring per feature (a new resource touches its own folder and one line of `app.module.ts`, not a 300-line file).\n\nThen open your NestJS backend at work and read `src/` like a map. You'll find a feature folder per resource, each with a controller, a service, DTOs, and a repository; a `common/` tree holding the cross-cutting machinery (auth, errors, response shaping, pagination, logging); a router layer that groups feature modules under URL prefixes and roles; a `configs/` folder; and `app.module.ts` at the root importing all of it. That project persists to MongoDB through Mongoose rather than Postgres — proof that none of this is database-specific. The structure is the point.\n\n## Watch out\n\n- **`new SomeService()` outside DI gives you a second instance** with its own state. Any in-memory cache, counter, or connection inside it silently diverges from the one the container manages, and nothing errors. This is why your own standards say services are injectable and never `new`ed.\n- **Circular module imports** deadlock the container. `forwardRef()` unblocks you, but treat it as a smell: two modules that need each other usually want a third module holding the shared piece.\n- **Providers are singletons by default.** Request-scoped providers exist, and they're contagious — anything that injects a request-scoped provider becomes request-scoped too, and gets constructed per request. Reach for it only for genuinely per-request state, like a database handle carrying the caller's identity.\n- **The temptation to write logic in the controller** is strongest exactly when the logic is small. Two lines of \"just check the owner here\" is how controllers become untestable, because a controller's dependencies are HTTP-shaped and a service's are not.",
+      "tasks": [
+        "Run `nest new tasks-nest` and `nest g resource tasks`, then open every generated file and write a one-line comment at the top of each saying what it is responsible for.",
+        "Port `GET /tasks`, `GET /tasks/:id` and `POST /tasks` from task-manager-api into the Nest app, with the Supabase client supplied as a provider — no top-level import of the client inside the service.",
+        "Delete `TasksService` from the module's `providers` array, boot the app, and read the resolution error out loud. Note which constructor index the `?` points at, then put it back.",
+        "Write one unit test for `TasksService` using `Test.createTestingModule` with a fake database provider, and confirm it runs with no network and no `.env`.",
+        "Instantiate the service twice — once through DI, once with `new` — and prove they hold separate state (see the trap).",
+        "Open your NestJS work project, pick one feature module, and draw its import graph on paper: which modules it imports, what it exports, who injects its service.",
+        "Count the lines of wiring in your Express `app.ts` versus the Nest `app.module.ts`, and count the files touched to add one endpoint in each. Write both numbers down."
+      ],
+      "quiz": [
+        {
+          "q": "Why does dependency injection make a service easier to unit test than the Express version that imports its Supabase client at the top of the file?",
+          "options": [
+            "Because Nest services run in an isolated worker thread during tests",
+            "Because the service declares its collaborators as constructor parameters, so a test can hand it a fake instead of the real client",
+            "Because decorators disable side effects while `NODE_ENV` is `test`",
+            "Because Nest replaces all imports with mocks automatically"
+          ],
+          "answer": 1,
+          "explain": "A top-level import means the module constructs its own dependency the moment it loads. Declaring it in the constructor moves that decision outward, so a test supplies a stub and nothing real is touched."
+        },
+        {
+          "q": "`TasksModule` lists `TasksService` in `providers` but not in `exports`. `RemindersModule` imports `TasksModule` and injects `TasksService`. What happens?",
+          "options": [
+            "It works — `providers` is enough for other modules to inject it",
+            "It works at runtime but the type is `any`",
+            "The app fails to start with a dependency resolution error naming the unsatisfied constructor argument",
+            "The container silently creates a second instance for RemindersModule"
+          ],
+          "answer": 2,
+          "explain": "`providers` makes a class injectable inside its own module; `exports` is what publishes it to importers. A missing export is caught at boot, which is exactly the point of the module system."
+        },
+        {
+          "q": "How does Nest know at runtime that a constructor parameter should be resolved to `TasksService`, given TypeScript types are erased when compiled?",
+          "options": [
+            "It parses the source file for type annotations at startup",
+            "`emitDecoratorMetadata` makes the compiler emit parameter types as metadata, which Nest reads via `reflect-metadata`",
+            "The provider name is matched by string against the parameter name",
+            "The `@Injectable()` decorator serializes the whole class into the module registry"
+          ],
+          "answer": 1,
+          "explain": "Decorators plus `emitDecoratorMetadata` write the design-time parameter types into metadata; `reflect-metadata` lets the container read them back. This is also why a broken tsconfig produces confusing injection failures."
+        },
+        {
+          "q": "You call `new TasksService(db)` in a script instead of injecting it. The service keeps an in-memory cache. What is the observable symptom?",
+          "options": [
+            "A runtime error, because `@Injectable()` classes cannot be constructed manually",
+            "Nothing — the container detects and reuses the existing instance",
+            "Two instances with separate caches that disagree, with no error or warning anywhere",
+            "The app fails to start on the next boot"
+          ],
+          "answer": 2,
+          "explain": "Nest providers are singletons managed by the container. Constructing one by hand produces a second, unmanaged object with its own state — no error, just two sources of truth that drift."
+        }
+      ],
+      "resources": [
+        {
+          "label": "NestJS documentation",
+          "url": "https://docs.nestjs.com"
+        },
+        {
+          "label": "NestJS — Modules",
+          "url": "https://docs.nestjs.com/modules"
+        },
+        {
+          "label": "NestJS — Providers and dependency injection",
+          "url": "https://docs.nestjs.com/providers"
+        },
+        {
+          "label": "TypeScript handbook — Decorators",
+          "url": "https://www.typescriptlang.org/docs/handbook/decorators.html"
+        },
+        {
+          "label": "roadmap.sh — Backend developer roadmap",
+          "url": "https://roadmap.sh/backend"
+        }
+      ],
+      "trap": {
+        "title": "The service that exists twice",
+        "content": "Your `TasksService` keeps a tiny in-memory counter of how many tasks were created this process. Add one, expose it on `GET /tasks/stats`, and confirm it climbs.\n\nNow, somewhere else — a job handler, a script, a second controller — write `const svc = new TasksService(db)` instead of injecting it, and create tasks through that. Hit `/tasks/stats` again.\n\nThe number doesn't move. You built a second service with its own counter, and nothing warned you: no error, no log, no type complaint. Whatever state that class holds — a cache, a connection, a rate-limit bucket, a debounce timer — now exists twice and disagrees with itself. This is the failure mode behind your own rule that services are injectable and never `new`ed, and it is almost impossible to debug after the fact, because the code looks correct on every line."
+      }
+    },
+    "m45-2": {
+      "content": "## The problem\n\nA signup endpoint takes an email and a password. The DTO declares exactly those two fields. Someone reads the API docs, opens a REST client, and posts a third:\n\n```json\n{ \"email\": \"me@example.com\", \"password\": \"hunter2\", \"role\": \"admin\" }\n```\n\nThe response is `201 Created`. The audit log shows a clean, successful signup. The new account can read every other user's orders. The DTO *was* validated — the validator confirmed email and password were present and well-formed, then handed the whole original body to the service, which passed it to the ORM, which happily wrote `role: \"admin\"`. That's **mass assignment**, and it is one config flag away from impossible.\n\nSame week, different incident: a query throws and the 500 response body carries the full stack trace. An attacker now knows your absolute file paths, your ORM and its version, and the shape of the failing query. Your mobile app shows the user a raw `TypeError`, because there was no consistent error envelope for it to read.\n\n## The idea\n\nBoth bugs are one mistake in two outfits: the boundary was treated as a suggestion instead of a filter. A boundary that only checks *what must be present* isn't one. It also has to decide what happens to everything else — strip it, or reject the request.\n\nNest's second contribution is **named slots** for boundary rules, so each rule lives in one place instead of being copy-pasted into forty handlers. There are five, in a fixed order:\n\n```text\nmiddleware → guard → interceptor (before) → pipe → handler\n           → interceptor (after) → exception filter (if anything threw)\n```\n\nPicture a passenger moving through an airport. Middleware is the building — doors, signage, cameras — it sees traffic but knows nothing about your flight. The guard is the agent deciding whether you get past this point at all. The pipe is the scanner that inspects your bag and confiscates what isn't allowed. The interceptor wraps your whole journey, timing it and stamping the outcome. The filter is the desk you're sent to when something goes wrong, so every problem produces the same paperwork.\n\n| Slot | What it can see | Reach for it when |\n|---|---|---|\n| Middleware | raw request and response, no handler context | helmet, CORS, body parsing, request ids, access logs |\n| Guard | the execution context plus route metadata | \"may this caller proceed?\" — authentication, roles, ownership |\n| Interceptor | before **and** after the handler; can wrap the result | response envelopes, timing, caching, timeouts |\n| Pipe | one argument's value | validating and transforming DTOs, parsing params |\n| Filter | a thrown exception | one consistent error shape for the whole API |\n\n## In practice\n\nA DTO is a class whose decorators describe the allowed shape:\n\n```ts\nexport class CreateTaskDto {\n  @IsString() @IsNotEmpty() @MaxLength(200)\n  title: string;\n\n  @IsOptional() @IsInt() @Min(1) @Max(3)\n  priority?: number;\n}\n```\n\nThe flag that closes the hole is on the global pipe, in `main.ts`:\n\n```ts\napp.useGlobalPipes(\n  new ValidationPipe({\n    whitelist: true,            // silently strip keys no DTO field declares\n    forbidNonWhitelisted: true, // or better: reject the request with a 400\n    transform: true,            // \"2\" becomes 2, plain body becomes a DTO instance\n  }),\n);\n```\n\n`whitelist` makes `role: \"admin\"` disappear before your service sees it. `forbidNonWhitelisted` upgrades silence to a loud 400. `transform` is the `z.coerce` you've been writing, and it's also what turns the plain body into a real instance of the DTO class.\n\nYou've been doing this with Zod for four weeks. Both tools do the same job in the same place and differ in direction:\n\n| | Zod | class-validator |\n|---|---|---|\n| Direction | schema first, type inferred from it | class first, decorators annotate it |\n| Lives as | a value you can compose, extend, reuse | a type the DI container and Swagger can read |\n| Strips unknown keys | `.strict()` / `.strip()` on the schema | `whitelist` on the pipe |\n| Nest integration | works fine behind a small custom pipe | native: pipes, Swagger schemas, DI-aware validators |\n\nNeither is better. Zod composes more elegantly; class-validator hands Nest one object it can use for validation, OpenAPI generation, and serialization at once. Use whichever the codebase already uses — the load-bearing word in both is **boundary**.\n\nResponses need the same discipline in reverse. Never return a database entity from a controller:\n\n```ts\nexport class TaskResponseDto {\n  @Expose() id: string;\n  @Expose() title: string;\n\n  @Exclude() internalOwnerId: string;\n  @Exclude() deletedAt: Date;\n}\n```\n\nWith `ClassSerializerInterceptor` registered globally, `@Exclude()` fields are dropped on the way out. The catch that bites everyone once: it only works on **class instances**. A plain object from your ORM carries no decorators, so nothing is excluded and the password hash ships. Return `plainToInstance(TaskResponseDto, row)`, and add a test asserting the secret field is absent.\n\nNow authentication, where your own rule earns its keep. Register the guard globally and make public routes opt out:\n\n```ts\n// app.module.ts — global, and still able to inject dependencies\nproviders: [{ provide: APP_GUARD, useClass: JwtAuthGuard }]\n```\n\n```ts\n@Injectable()\nexport class JwtAuthGuard extends AuthGuard(\"jwt\") {\n  constructor(private reflector: Reflector) { super(); }\n\n  canActivate(context: ExecutionContext) {\n    const isPublic = this.reflector.getAllAndOverride(IS_PUBLIC_KEY, [\n      context.getHandler(),\n      context.getClass(),\n    ]);\n    return isPublic ? true : super.canActivate(context);\n  }\n}\n```\n\n`@Public()` is just `SetMetadata(IS_PUBLIC_KEY, true)`. The direction matters more than the code: with a global guard, forgetting a decorator leaves a route **locked** and someone files a bug. With per-route `@UseGuards(...)`, forgetting it leaves the route **open** and nobody files anything. Default-closed makes your mistakes noisy.\n\nErrors get one shape, decided in one file:\n\n```ts\n@Catch()\nexport class AllExceptionsFilter implements ExceptionFilter {\n  catch(err: unknown, host: ArgumentsHost) {\n    const res = host.switchToHttp().getResponse();\n    const status = err instanceof HttpException ? err.getStatus() : 500;\n    res.status(status).json({\n      statusCode: status,\n      message: err instanceof HttpException ? err.getResponse() : \"Internal server error\",\n      requestId: res.locals.requestId,\n    });\n  }\n}\n```\n\nThrow typed exceptions from services — `NotFoundException`, `UnauthorizedException`, `ConflictException` — and the filter maps them to status codes. Anything untyped becomes a generic 500, with the detail logged server-side and never serialized. That's incident number two closed.\n\nConfig gets the day-5 fail-fast treatment, except the schema runs before the HTTP server binds:\n\n```ts\nConfigModule.forRoot({\n  isGlobal: true,\n  validationSchema: Joi.object({\n    NODE_ENV: Joi.string().valid(\"development\", \"staging\", \"production\").required(),\n    DATABASE_URL: Joi.string().uri().required(),\n    JWT_SECRET: Joi.string().min(32).required(),\n  }),\n});\n```\n\nA missing secret should kill the process at boot, not produce a 500 at 3am on the one endpoint that reads it.\n\nTesting is where DI pays you back. A unit test builds a module holding only what it needs:\n\n```ts\nconst moduleRef = await Test.createTestingModule({\n  controllers: [TasksController],\n  providers: [{ provide: TasksService, useValue: { findOne: jest.fn() } }],\n}).compile();\n```\n\nNo database, no network, milliseconds. For end-to-end, boot the real app and drive it over HTTP with supertest:\n\n```ts\nconst app = moduleRef.createNestApplication();\napp.useGlobalPipes(new ValidationPipe({ whitelist: true }));\nawait app.init();\nawait request(app.getHttpServer()).post(\"/tasks\").send({ title: \"x\", role: \"admin\" }).expect(400);\n```\n\nThat last line is the regression test for the incident at the top of this module. Write it once and mass assignment can't come back.\n\n## In your world\n\nYou own two backends built on opposite philosophies, and both choices are correct. The social app's backend is Bun and Hono: small surface, edge-friendly, every millisecond and dependency visible. The other is NestJS: many contributors, years of lifespan, structure the framework won't let anyone skip.\n\n| Question to ask | Points to NestJS | Points to Hono / Express |\n|---|---|---|\n| How many people touch this per quarter? | five or more, rotating | one to three, stable |\n| How long will it live? | years, dozens of features | months, or a focused service |\n| Where does it run? | a Node container | edge, workers, Bun, cold-start sensitive |\n| Who enforces structure? | the framework, at boot | code review and discipline |\n| Cost of one new endpoint | four files and some ceremony | one handler |\n| Cross-cutting concerns | first-class slots, applied globally | hand-rolled middleware you compose |\n| What you pay | boot-time DI, heavier deps, a learning curve | vigilance, and eventual drift |\n\nThe choice is about team size and lifespan, not fashion. Now audit your NestJS project against this module: find where the global `ValidationPipe` is configured and whether `whitelist` is set; find how routes are protected and decide whether the default is open or closed; find the exception filter and confirm no stack trace can reach a response body in production. Write down what you find. These are the rules already in your own engineering standards — you'll be enforcing them in review soon, and that lands very differently when you can say *why*.\n\n## Watch out\n\n- **Guard order and scope.** Globals run before route-scoped guards, and a guard registered with `useGlobalGuards()` cannot inject anything — use the `APP_GUARD` provider token when your guard needs a `Reflector` or a service.\n- **No `whitelist: true` means mass assignment is still wide open,** even with a perfectly decorated DTO. Validation that only checks required fields is not a boundary.\n- **Returning entities directly** leaks whatever the table happens to hold today — password hashes, soft-delete flags, internal ids, that column someone added last sprint. Response DTOs are the only reliable answer.\n- **`@Public()` at the wrong level.** On the controller, it unlocks every route in it, including the ones you add next month. Put it on the single handler that needs it.\n- **Interceptors that swallow errors.** A `catchError` that returns an empty value turns failures into `200 OK` with a null body. Your monitoring goes quiet, your dashboards look healthy, and the mobile app renders an empty screen.",
+      "tasks": [
+        "Reproduce the mass-assignment trap end to end, then close it with `whitelist: true` and `forbidNonWhitelisted: true` and watch the same request become a 400.",
+        "Convert two of your Zod schemas into class-validator DTOs, and write down for each one which tool you'd rather maintain and why.",
+        "Add a response DTO with `@Exclude()` on a sensitive field, return a plain database row from the controller, and confirm the field still leaks. Fix it with `plainToInstance` and add a test asserting the field is absent.",
+        "Register a global auth guard through the `APP_GUARD` token, add a `@Public()` decorator, then add a new route with no decorators and confirm it returns 401 rather than 200.",
+        "Write an exception filter producing one error envelope, throw `NotFoundException` from a service, and verify no stack trace appears in the response body when `NODE_ENV` is production.",
+        "Add a `ConfigModule` validation schema, remove one required variable, and confirm the process exits at boot instead of failing on a request.",
+        "Write one unit test with `Test.createTestingModule` and a mocked provider, plus one supertest e2e test asserting 401 on a protected route and 400 on a body carrying an undeclared field.",
+        "Audit your NestJS work project: where the global `ValidationPipe` is configured and whether `whitelist` is on, whether route protection defaults to open or closed, and whether the error filter can ever serialize a stack trace. Write the findings down."
+      ],
+      "quiz": [
+        {
+          "q": "What is the correct order in which Nest runs these for an incoming request?",
+          "options": [
+            "pipe, guard, middleware, handler, interceptor, filter",
+            "middleware, guard, interceptor (before), pipe, handler, interceptor (after), filter",
+            "guard, middleware, pipe, interceptor, handler, filter",
+            "middleware, pipe, guard, handler, filter, interceptor"
+          ],
+          "answer": 1,
+          "explain": "Middleware runs first with no handler context, then guards decide access, then interceptors wrap the call, then pipes transform each argument, then the handler runs. Exception filters catch whatever is thrown along the way."
+        },
+        {
+          "q": "Your DTO declares only `title`. A request body includes `title` and `isAdmin`, and the global `ValidationPipe` has `transform: true` but no `whitelist`. What reaches your service?",
+          "options": [
+            "Only `title` — undeclared keys are always dropped",
+            "Both keys, and the request succeeds",
+            "Nothing — the request is rejected with a 400",
+            "Both keys, but `isAdmin` is coerced to a string"
+          ],
+          "answer": 1,
+          "explain": "Without `whitelist: true`, validation only checks the fields it knows about and forwards the rest untouched. `whitelist` strips undeclared keys; `forbidNonWhitelisted` rejects the request instead."
+        },
+        {
+          "q": "You need a check that reads route metadata to decide whether the caller may proceed, and it needs to inject a service. Which slot, registered how?",
+          "options": [
+            "Middleware, applied in `configure()` on the module",
+            "A guard registered with `app.useGlobalGuards(new MyGuard())`",
+            "A guard provided under the `APP_GUARD` token so the container can inject its dependencies",
+            "An interceptor registered globally in `main.ts`"
+          ],
+          "answer": 2,
+          "explain": "Only guards get an `ExecutionContext` with route metadata, and only a guard registered as a provider (via `APP_GUARD`) participates in DI. A guard constructed by hand in `main.ts` cannot inject anything."
+        },
+        {
+          "q": "A response DTO marks `passwordHash` with `@Exclude()`, `ClassSerializerInterceptor` is global, and yet the hash appears in the JSON. Why?",
+          "options": [
+            "`@Exclude()` only applies to request bodies, not responses",
+            "The controller returned a plain object from the ORM, not an instance of the DTO class, so there were no decorators to apply",
+            "The interceptor runs before the handler and so never sees the value",
+            "`@Exclude()` requires `whitelist: true` on the ValidationPipe"
+          ],
+          "answer": 1,
+          "explain": "class-transformer works off metadata attached to a class. A plain row is just an object, so serialization has nothing to act on — construct the DTO instance (for example with `plainToInstance`) before returning it."
+        },
+        {
+          "q": "Why is a global auth guard with a `@Public()` opt-out safer than putting `@UseGuards(JwtAuthGuard)` on each route?",
+          "options": [
+            "Global guards are faster because they are compiled once",
+            "Per-route guards cannot read route metadata",
+            "Because forgetting the decorator leaves a route locked and someone reports it, instead of leaving it open and nobody noticing",
+            "Because `@Public()` also disables rate limiting where it isn't needed"
+          ],
+          "answer": 2,
+          "explain": "The default matters more than the mechanism. Default-closed turns an omission into a visible 401; default-open turns the same omission into an unauthenticated endpoint that no one is looking for."
+        }
+      ],
+      "resources": [
+        {
+          "label": "NestJS — Validation and the ValidationPipe",
+          "url": "https://docs.nestjs.com/techniques/validation"
+        },
+        {
+          "label": "NestJS — Guards",
+          "url": "https://docs.nestjs.com/guards"
+        },
+        {
+          "label": "NestJS — Exception filters",
+          "url": "https://docs.nestjs.com/exception-filters"
+        },
+        {
+          "label": "NestJS — Testing",
+          "url": "https://docs.nestjs.com/fundamentals/testing"
+        },
+        {
+          "label": "roadmap.sh — API security best practices",
+          "url": "https://roadmap.sh/best-practices/api-security"
+        }
+      ],
+      "trap": {
+        "title": "The 201 that made an admin",
+        "content": "Add a `role` column to your users table, defaulting to `\"user\"`. Write a signup endpoint whose DTO declares only `email` and `password`, and whose service passes the DTO straight to the insert. Register the global `ValidationPipe` with `transform: true` but **without** `whitelist`.\n\nNow post this:\n\n```json\n{ \"email\": \"attacker@example.com\", \"password\": \"hunter2\", \"role\": \"admin\" }\n```\n\nRead the response: `201 Created`, no warning anywhere. Then read the row. `role` is `admin`.\n\nSit with the fact that your validator ran, passed, and reported success. It confirmed the two fields it knew about and forwarded everything else untouched. Now add `whitelist: true`, repeat the request, and watch the extra key vanish before the service is called. Add `forbidNonWhitelisted: true` and watch the same request become a 400. Then write the e2e test that fails if either flag is ever removed — that test is the only thing standing between this bug and its second appearance."
+      }
+    },
+    "sq-13": {
+      "content": "## The problem\n\nOpening a mature NestJS codebase feels like reading a language where you know every word and no sentences. Eleven decorators sit above one method. A controller lives four folders from the module that lists it. Something called a repository module exports a repository, and neither is where you'd look. Two days in you still navigate by full-text search, which means you can't review a pull request in it with any confidence.\n\n## The idea\n\nThe cure isn't more reading. It's having built the same thing once, in a shape you chose — after that, someone else's structure reads as *decisions*, and you can tell which were deliberate.\n\nSo port, don't rewrite. Freeze the Task Manager's behaviour: same endpoints, same tables, same response bodies. Only the shape changes. That isolates the variable, so what you feel at the end is NestJS and not new requirements.\n\n## In practice\n\n1. `nest new task-manager-nest`, then `ConfigModule.forRoot` with a schema covering every variable the Express app reads. Boot with one missing and confirm the process dies.\n2. A `SupabaseModule` providing the client as an exported provider. Nothing else imports `@supabase/supabase-js` directly.\n3. `nest g resource tasks`, then move `list`, `getById`, `create`, `update`, `delete` into `TasksService` — logic unchanged, `db` arriving through the constructor.\n4. Zod schemas become DTOs with class-validator decorators, behind a global `ValidationPipe` with `whitelist: true` and `forbidNonWhitelisted: true`.\n5. Response DTOs with `@Exclude()` on anything the client has no business seeing, plus `ClassSerializerInterceptor`.\n6. A global `JwtAuthGuard` via the `APP_GUARD` token, with `@Public()` on health and login only.\n7. One exception filter for the whole error envelope, with `NotFoundException` and `ForbiddenException` thrown from services.\n8. Repeat for categories, and time yourself. The second resource is the point — it's where the per-feature cost drops.\n9. Unit-test `TasksService` with a fake provider and no network, then e2e with supertest: 401 unauthenticated, 400 on an undeclared field.\n\n## In your world\n\nNow open your NestJS work project's `src/` and name each thing you just built. Per-feature folders holding controller, service, DTOs, repository. A `common/` tree with auth guards, error filters, response interceptors, pagination pipes. A router layer grouping features by prefix and audience. A `configs/` folder plus an env schema that fails at boot. Where its choices differ from yours — a repository layer wrapping the ODM, one decorator composing guard, policy and Swagger — ask what problem at that scale bought them. That question is your review voice.\n\n## Watch out\n\n- **A per-request database handle can't be a singleton.** If the client carries the caller's identity so row-level security applies, a module-scoped provider hands one user's handle to every request. Use a factory the service calls per request, or a deliberately request-scoped provider.\n- **Don't copy a boilerplate's depth into a five-endpoint app.** Its layers exist for forty modules and ten contributors; at your size they are ceremony.\n- **Port the behaviour, not the bugs.** Anything you can't explain while moving it should be fixed in the Express version first, with a test.",
+      "tasks": [
+        "Port the tasks and categories resources of task-manager-api into a fresh Nest app with identical endpoints and response bodies, and diff a few real responses against the Express app to prove nothing changed.",
+        "Register the global `ValidationPipe` with `whitelist: true` and `forbidNonWhitelisted: true`, a global `JwtAuthGuard` via `APP_GUARD` with `@Public()` on health and login, and one exception filter for the whole app.",
+        "Write unit tests for both services with fake providers, plus supertest e2e tests covering 401 on a protected route, 404 from a typed exception, and 400 on an undeclared body field.",
+        "Time how long the second resource took versus the first, and write one paragraph on where the time went.",
+        "Read your NestJS work project's `src/` tree top to bottom and name, for each folder, which pattern from this port it corresponds to. List the three choices it makes that yours does not, and what scale would justify each."
+      ],
+      "quiz": [
+        {
+          "q": "Why port the Task Manager instead of building a new app in Nest?",
+          "options": [
+            "Because Nest can generate a module automatically from Express routes",
+            "Because holding the behaviour constant means everything unfamiliar you feel is the framework, not new requirements",
+            "Because the Express version's tests transfer without modification",
+            "Because Nest requires an existing OpenAPI document to scaffold from"
+          ],
+          "answer": 1,
+          "explain": "Changing one variable at a time is the whole method. Same endpoints and same data means the only difference you experience is structural."
+        },
+        {
+          "q": "Your Supabase client carries the caller's JWT so row-level security applies. What is wrong with providing it as a normal module-scoped provider?",
+          "options": [
+            "Nothing — Nest recreates providers per request by default",
+            "It is a singleton, so one user's authenticated handle would be shared across every request",
+            "Supabase clients cannot be used inside a DI container",
+            "It forces every consuming module to become request-scoped"
+          ],
+          "answer": 1,
+          "explain": "Providers are singletons unless you say otherwise. A handle that carries identity must be created per request — via a factory the service calls, or a deliberately request-scoped provider."
+        },
+        {
+          "q": "After the port, which patterns should you expect to recognize in a mature NestJS boilerplate's `src/`?",
+          "options": [
+            "Per-feature modules with controller, service, DTOs and repository; a shared tree for guards, filters and interceptors; and config validated at boot",
+            "A single flat routes folder with one file per endpoint",
+            "Controllers containing the database queries, with services reserved for background jobs",
+            "One module per database table, with no shared code"
+          ],
+          "answer": 0,
+          "explain": "That is the shape Nest pushes you toward and the shape you just built by hand — which is why a large boilerplate should now read as decisions rather than noise."
+        }
+      ],
+      "resources": [
+        {
+          "label": "NestJS documentation",
+          "url": "https://docs.nestjs.com"
+        },
+        {
+          "label": "NestJS — First steps and the CLI",
+          "url": "https://docs.nestjs.com/first-steps"
+        },
+        {
+          "label": "class-validator decorator reference",
+          "url": "https://github.com/typestack/class-validator"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,668 @@
+{
+  "phaseId": "p5",
+  "modules": {
+    "m5-1": {
+      "content": "## The problem\n\nDay 30. You clone the work backend, open it, and your stomach drops. There is no `express` in `package.json`. There is no `app.listen()`. Handlers take a single argument called `c`. Queries look like `db.select().from(posts).where(eq(posts.authorId, id))`. The test file imports from `bun:test`. Twenty-nine days of Node, Express and supabase-js, and the first screen you look at feels like day one again.\n\nThen you do the thing everyone does: you start reading files, top to bottom, hoping the shape will emerge. Three hours later you can name the folders and you cannot answer one question about how a request becomes a response. You close the laptop convinced you have to learn a whole new stack before you can be useful.\n\nThat conclusion is wrong, and it costs you a week. You are looking at a different spelling of things you already know.\n\n## The idea\n\nEvery HTTP backend fills the same four slots:\n\n- a **runtime** that executes your JavaScript and owns the process\n- an **HTTP framework** that matches a method and path to a function, with middleware in front\n- a **database client** that turns your intent into SQL and rows into objects\n- a **test runner**\n\nNode, Express, supabase-js and Jest are one set of choices. Bun, Hono, Drizzle and `bun test` are another. The slots do not move.\n\nAnalogy from your world: you have swapped navigation libraries before. Both had a stack, a route, params, and a way to push a screen. When you migrated you did not relearn navigation — you relearned prop names for a week and then you were fine. This is that, one layer down.\n\n| Concept | Node + Express + supabase-js | Bun + Hono + Drizzle |\n|---|---|---|\n| Runtime | Node, plus ts-node or a build step | Bun, runs `.ts` directly, no build |\n| Server start | `app.listen(3000)` | export an object with `port` and `fetch` |\n| Handler args | `(req, res, next)` | `(c)` — one context object |\n| Read body | `req.body`, after a parser | `await c.req.json()` |\n| Read a param | `req.params.id` | `c.req.param(\"id\")` |\n| Send JSON | `res.json(data)` | `return c.json(data)` |\n| Per-request state | assign onto `req` | `c.set(...)` / `c.get(...)` |\n| Middleware | `(req, res, next)` then `next()` | `async (c, next)` then `await next()` |\n| Validation | zod by hand or a wrapper | zod wired into the route definition |\n| Query | `supabase.from(\"posts\").select()` | `db.select().from(posts)` |\n| Row types | hand-written or generated | inferred from the schema file |\n| Tests | Jest plus config | `bun test`, no config |\n\n## In practice\n\nThe same endpoint, twice.\n\n```ts\n// Express\napp.get(\"/notes/:id\", async (req, res) => {\n  const note = await getNote(req.params.id);\n  if (!note) return res.status(404).json({ error: \"Not found\" });\n  res.json(note);\n});\n```\n\n```ts\n// Hono\napp.get(\"/notes/:id\", async (c) => {\n  const note = await getNote(c.req.param(\"id\"));\n  if (!note) return c.json({ error: \"Not found\" }, 404);\n  return c.json(note);\n});\n```\n\nTwo real differences: one context object instead of two, and the handler **returns** a response instead of writing to a stream. Hono is built on the Web platform's `Request` and `Response` — the same objects `fetch()` hands you in the app. You have been holding the other end of this exact API for years.\n\nNow the database.\n\n```ts\n// supabase-js: a query builder that speaks HTTP to PostgREST\nconst { data, error } = await supabase\n  .from(\"notes\")\n  .select(\"id, title\")\n  .eq(\"user_id\", userId)\n  .limit(20);\n```\n\n```ts\n// Drizzle: typed SQL over a direct Postgres connection\nconst rows = await db\n  .select({ id: notes.id, title: notes.title })\n  .from(notes)\n  .where(eq(notes.userId, userId))\n  .limit(20);\n```\n\nDrizzle is *closer* to the SQL you learned in phase 1, not further from it. `eq`, `and`, `desc` and `inArray` are functions that compose into a WHERE clause you can read out loud. There is no `data` / `error` envelope — it throws, so your try/catch habits apply unchanged. And the row type comes from the same schema file your migration mirrors, so a column rename surfaces as a type error instead of a runtime `undefined`.\n\n## In your world\n\nAdd up what actually transfers from the last 29 days: HTTP semantics, status codes, idempotency, middleware order, validation at the boundary, the route to service to data split, SQL, indexes, transactions, row-level security, cursor pagination, background jobs on a separate process, structured logging. All of it. None of that was Express knowledge — Express was just the delivery vehicle.\n\nWhat is genuinely new is a short list: Hono's context object, Drizzle's query functions and inferred types, Bun as runtime and test runner, and this codebase's habit of declaring request and response schemas on the route itself. That is a few days of muscle memory, and you get it by typing rather than reading. Which is the real instruction here: open your Notes API and your Task Manager and port one endpoint from each into Hono plus Drizzle by hand. Not a rewrite. One endpoint, typed out yourself, no AI generation. The paralysis breaks the moment you make one thing work.\n\n## Watch out\n\n- A Hono handler must `return` its response. Forget the `return` and you get a fall-through, not an error — the same family of bug as forgetting to return inside a `.then()`.\n- `c.req.json()` is async and consumes the body once. Call it twice and the second call gets nothing.\n- A Drizzle `select()` always resolves to an array. Destructure `const [row] = ...` and add `.limit(1)`; never assume a single object.\n- Drizzle throws instead of returning `{ data, error }`. Wrap the awaits, catch as `unknown`, and do not quietly continue past a missing row.\n- Resist writing Express-shaped code in Hono because it feels familiar. Match the house style of the repo you are in. A PR that imports a new pattern is a PR about your preferences.",
+      "tasks": [
+        "Build your own translation table from the Hono docs without looking at this module: find the equivalent of `req.body`, `req.params`, `res.json()`, `res.status()`, `next()` and `app.use()`.",
+        "Port one endpoint from your Notes API into Hono by hand — no AI generation, no copy-paste — and get it answering on a real port.",
+        "Rewrite one supabase-js query from your Task Manager as a Drizzle query, and write the SQL it produces in a comment above it.",
+        "Run a test file under `bun test` and note three things Bun's runner does differently from Jest (config, globals, speed).",
+        "Write down the five things in this stack that are genuinely new to you. Keep the list short — it is your study plan for the week."
+      ],
+      "quiz": [
+        {
+          "q": "A Hono handler computes a response but the developer forgets the `return` before `c.json(data)`. What happens?",
+          "options": [
+            "Hono serialises the last expression automatically",
+            "The request falls through the handler and the client gets a 404 or an empty response",
+            "TypeScript refuses to compile the handler",
+            "The client receives a 500 with a stack trace"
+          ],
+          "answer": 1,
+          "explain": "Hono handlers return a Response object rather than writing to a stream. No return means nothing was produced, so routing continues past your handler — a silent bug, not a compile error."
+        },
+        {
+          "q": "Which statement about Drizzle compared with supabase-js is accurate?",
+          "options": [
+            "Drizzle also returns a `{ data, error }` envelope",
+            "Drizzle sends HTTP requests to PostgREST under the hood",
+            "Drizzle builds SQL and runs it over a direct Postgres connection, throwing on failure",
+            "Drizzle needs a separate build step before it can run"
+          ],
+          "answer": 2,
+          "explain": "Drizzle is typed SQL over a real Postgres connection. There is no envelope to unwrap — failures throw, so ordinary try/catch handling applies."
+        },
+        {
+          "q": "Moving from 29 days of Express into this codebase, which of these does NOT transfer and has to be relearned?",
+          "options": [
+            "HTTP status semantics and idempotency",
+            "The exact API for reading params and returning a response",
+            "The route to service to data layering",
+            "SQL, indexes and transactions"
+          ],
+          "answer": 1,
+          "explain": "Only the surface API changes. Concepts, layering and everything database-related carry over unchanged — which is why the stack switch is days of muscle memory, not weeks of learning."
+        },
+        {
+          "q": "`await db.select().from(notes).where(eq(notes.id, id))` resolves to what?",
+          "options": [
+            "An array of rows, even when you expect exactly one",
+            "The row object, or null when nothing matched",
+            "A `{ data, error }` object",
+            "A query object you still have to pass through a `.single()` helper"
+          ],
+          "answer": 0,
+          "explain": "Drizzle selects always resolve to an array. Destructure `const [row] = ...` and add `.limit(1)` so the intent is explicit in the query as well as the code."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Hono documentation",
+          "url": "https://hono.dev"
+        },
+        {
+          "label": "Bun documentation",
+          "url": "https://bun.sh/docs"
+        },
+        {
+          "label": "Drizzle ORM overview",
+          "url": "https://orm.drizzle.team/docs/overview"
+        },
+        {
+          "label": "Express documentation (for the comparison)",
+          "url": "https://expressjs.com"
+        },
+        {
+          "label": "roadmap.sh — backend track",
+          "url": "https://roadmap.sh/backend"
+        }
+      ]
+    },
+    "m5-2": {
+      "content": "## The problem\n\nA new engineer joins, clones the repo, and starts reading `src/` in alphabetical order. Config, then database, then jobs. Four days later they can recite the folder names and still cannot tell you what happens when the app asks for a feed. Fifty files read, zero requests traced.\n\nThe second version of this failure is faster and more embarrassing. You clone, immediately change something, run the test suite, and three tests fail. Now you have no idea whether you broke them. You spend the evening debugging a test that was already red before you arrived.\n\n## The idea\n\nTwo habits fix both.\n\n**Establish a green baseline before you touch anything.** Install, start the local database, replay the migrations, then run lint, type-check and the tests. Write the result down, failures included. From that moment on, a failure is a fact about the repo rather than a mystery about you.\n\n**Then follow exactly one request, all the way through.** Not one file — one request. Pick the simplest authenticated GET you can find and walk it: process entry, router, route definition, the middleware that ran, the service function, the database query, the response schema, the JSON on the wire.\n\nAnalogy: this is how you would reverse-engineer an unfamiliar screen in a React Native app you did not write. You do not read `components/` alphabetically. You find the navigator entry, find the screen, and follow one tap through the handler into the hook into the API call. Backends have the same spine, and it is easier, because the entry point is a URL you can type.\n\n## In practice\n\nThe baseline, in order:\n\n```bash\nbun install\nbun run supabase:start    # local Postgres and auth, in Docker\nbun run migration:reset   # replay every migration onto a fresh database\nbun run lint\nbun run type-check\nbun test\n```\n\nThe test suite is integration-heavy — it wants a real Postgres, not mocks. Skip the local database step and dozens of tests fail for one boring reason, which you will misread as a broken repo.\n\nThe API is also only one of three processes. `bun run dev` gives you HTTP and sockets and nothing else. Background work — notifications, media processing, feed scoring — lives in separate worker processes you start yourself:\n\n```bash\nbun run dev           # API\nbun run worker        # general background jobs\nbun run worker:feed   # feed jobs, a separate queue instance\n```\n\nTest a feature that ends with \"and then a notification arrives\" while only the API runs, and the notification never arrives and nothing tells you why. Learn that on day 31, not during your first real ticket.\n\nThen the trace. Change nothing, print nothing, just read and take notes:\n\n1. Find the process entry file and see how the framework app gets attached to a port.\n2. Open `src/routes/index.ts` — the barrel where every route module is mounted. That file is your map of the HTTP surface.\n3. Pick one route module and find one route definition: method, path, request schema, response schema, middleware list.\n4. Find the service function it calls. Look hard at the first parameter: a database handle, passed in, not imported.\n5. Read the query and map each call back to the SQL it produces.\n6. Compare the object the service returns against the declared response schema, field by field.\n\nNow write ten sentences describing that chain in your own words. Sentences, not bullets copied out of the files. If one comes out vague — \"then the service does its thing\" — that is precisely the link you did not understand. Go back to it.\n\n## In your world\n\nRead the repo's architecture document end to end, then read its known-traps section twice. That section is the accumulated cost of other people's ruined afternoons: which docs are stale, where two versions of a subsystem coexist, which mistakes fail loudly and which fail in silence. A repo that ships a traps list is doing you a favour. The ones without a list have the same traps, undocumented.\n\nYou already own the mental model this codebase implements. Your Notes API had route to service to data. Your Task Manager had auth middleware, versioned migrations and row-level security. The work backend is that, with more domains, three processes instead of one, and stricter conventions. So as you trace your first route, name each stage out loud in the vocabulary you already have: this is the bouncer, this is the service, this is the shape contract. Most of what feels like ignorance is a labelling problem.\n\n## Watch out\n\n- Do not fix the failing test on day one. Note it and ask. It may be a known flake or a missing local dependency, and \"the new person rewrote our test\" is a bad first impression.\n- When the README, the architecture doc and the code disagree, trust the code, then the architecture doc, then the README. READMEs rot first because no CI job checks them.\n- Do not read the whole docs folder. Read the architecture map, read what your current task touches, stop. A big docs folder always has mixed freshness.\n- Resist grepping for a symptom before you can trace a request. Search is a scalpel and you do not have the anatomy yet.\n- Record the auth story for the route you trace: which middleware guarded it, and what the handler would have done if that middleware had not run.",
+      "tasks": [
+        "Run the full baseline before you change one line: install, start local Supabase, replay migrations, then lint, type-check and the test suite. Write down every failure verbatim.",
+        "Read the repo's architecture document end to end, then rewrite each item in its known-traps section as a one-liner of the form: if I do X, Y fails silently.",
+        "Hand-trace one authenticated GET: process entry, the route barrel in `src/routes/index.ts`, the route definition, the middleware, the service, the Drizzle query, the response schema.",
+        "Write ten sentences describing that chain in your own words, with nothing copied from the files. Mark any sentence that came out vague and go back to that link.",
+        "List the three runtime processes and, for each, one feature that silently does nothing when that process is not running.",
+        "Start the API and both workers together once, and confirm a background-driven feature actually completes locally."
+      ],
+      "quiz": [
+        {
+          "q": "Why run lint, type-check and the tests before changing anything?",
+          "options": [
+            "CI refuses to run on a branch without a clean first run",
+            "So that any later failure is attributable to your change rather than pre-existing",
+            "It warms the database caches and makes the suite faster",
+            "Migrations only apply against a clean working tree"
+          ],
+          "answer": 1,
+          "explain": "A baseline converts unknowns into facts. Without one, the first red test costs you an evening of debugging something you did not break."
+        },
+        {
+          "q": "The suite is integration-heavy rather than mock-heavy. What does that mean for you locally?",
+          "options": [
+            "You need a real local Postgres with all migrations applied before the tests mean anything",
+            "The tests can only run in CI",
+            "You should run them once without a database to see which ones are pure",
+            "Database calls are stubbed, so setup does not matter"
+          ],
+          "answer": 0,
+          "explain": "Integration tests talk to a real database. Skip the local Postgres step and dozens of tests fail for one boring reason that looks like a broken repo."
+        },
+        {
+          "q": "What is the most effective way to start understanding an unfamiliar backend?",
+          "options": [
+            "Read `src/` in alphabetical order so you miss nothing",
+            "Read every file in the docs folder first",
+            "Follow one request from process entry through router, service, query and response schema",
+            "Grep for the feature name and read every hit"
+          ],
+          "answer": 2,
+          "explain": "One traced request teaches you the spine of the system. Fifty files read in isolation teach you folder names."
+        },
+        {
+          "q": "The README, the architecture doc and the code disagree about how something works. What order do you trust them in?",
+          "options": [
+            "README first — it is the front door and gets the most eyes",
+            "Whichever file was edited most recently",
+            "Code, then the architecture doc, then the README",
+            "The architecture doc always wins, since it is the designed intent"
+          ],
+          "answer": 2,
+          "explain": "Code is the only document that executes. READMEs rot first because no CI job verifies them."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Supabase local development",
+          "url": "https://supabase.com/docs/guides/local-development"
+        },
+        {
+          "label": "Hono documentation",
+          "url": "https://hono.dev"
+        },
+        {
+          "label": "Bun documentation",
+          "url": "https://bun.sh/docs"
+        },
+        {
+          "label": "roadmap.sh — backend track",
+          "url": "https://roadmap.sh/backend"
+        }
+      ]
+    },
+    "m5-3": {
+      "content": "## The problem\n\nA developer is chasing a bug: an endpoint returns an empty array when it obviously should not. The rows are right there in the database viewer. Out of patience at 6pm, they swap the request-scoped database handle for the privileged one the job handlers use — just to check whether the query itself works. It works. The list appears. The bug looks fixed. The swap stays in, because the ticket is closed.\n\nNothing catches fire. The tests pass, because the test logs in as one user and reads that user's rows, which works either way. The response is a 200 with valid JSON. Monitoring is green. But that endpoint now hands rows belonging to every user in the database to anyone holding any valid session, and it will keep doing that until a human reads the diff. This is the cheapest mistake to make in the codebase and by far the most expensive to have made.\n\n## The idea\n\nThere are two doors into the same database.\n\nThe **request-scoped handle** is a visitor badge. Middleware issues one at the start of every request and stamps the caller's identity onto that connection — literally setting a Postgres session variable so the database knows who is asking. Every query on that connection is filtered by row-level security policies. The badge opens the doors with your name on them.\n\nThe **privileged handle** is the master key on the janitor's belt. It connects as a role that RLS does not apply to, because background jobs legitimately need to act across all users: send tomorrow's digest, recompute scores, delete an account and everything attached to it. Same database, same tables, no locks.\n\nBoth come from the same module, and the privileged one is often exported under a short, friendly name — the kind autocomplete offers first. That is the whole trap: a geometry problem, not an intelligence problem.\n\nNow the part people still get wrong after they understand the pools: **RLS makes a foreign row not exist.** It does not make it forbidden. Ask for another user's note through a badge connection and you get an empty result set, not a 403. Postgres quietly ANDs your policy's condition onto the WHERE clause and the row is gone before your code sees it.\n\nThat one distinction drives how you test. \"Forbidden\" is loud; you would notice a 403. \"Does not exist\" is quiet, and quiet is indistinguishable from \"worked fine\". So the only test that proves a policy exists is one that asks for a row you should not be able to see and asserts that you got nothing.\n\n## In practice\n\nMiddleware puts the handle on the request context. Routes take it back out and never import a pool:\n\n```ts\n// middleware: one dedicated connection per request, identity stamped on it\napp.use(\"*\", requestDbMiddleware);\n\n// route\nconst db = c.get(\"db\");\nconst notes = await listNotes(db, { limit: 20 });\nreturn c.json({ notes });\n```\n\nServices take the handle as their **first argument** and never reach for a global:\n\n```ts\nexport async function listNotes(db: RequestDb, opts: { limit: number }) {\n  return db.select().from(notes).orderBy(desc(notes.createdAt)).limit(opts.limit);\n}\n```\n\nThat signature is a security feature, not a style preference. The caller decides which identity the query runs as: a route passes the badge, a job handler passes the master key, a test passes a handle bound to one specific user. A service that imports its own connection takes that decision away from every caller, forever.\n\nNotice what the service does *not* contain: a `where` clause pinning rows to the current user. It could, and defence in depth says sometimes it should. But the reason it is safe without one lives in the migration:\n\n```sql\nalter table notes enable row level security;\n\ncreate policy notes_select_own on notes\n  for select\n  using (user_id = current_setting('app.current_user_id', true)::uuid);\n```\n\nAnd the test that actually proves it:\n\n```ts\n// user B asks for user A's note, by id\nconst rows = await getNoteById(dbAsUserB, noteOwnedByA.id);\nexpect(rows).toHaveLength(0); // not \"expect a 403\"\n```\n\n## In your world\n\nYou built this in phase 2. The Task Manager RLS module made you write the manual WHERE-clause version first and watch one forgotten clause turn into a data leak; the pool split is that lesson wearing a bigger hat. In your practice projects the equivalent knob was the anon key versus the service-role key: it ignores RLS in exactly the same way, for the same reason, with the same consequence when it ends up in a request path.\n\nIn the work codebase the split is slightly wider than two: there is a handle for socket connections and one the auth library uses. Learn those when you touch them. The rule that will actually appear in your PRs is one line long — **the request path uses the injected handle, and only job handlers use the privileged pool.** When you review someone else's PR, one grep answers most of the question: a file under the routes or request-path service directories importing a connection from `src/db/pools.ts` deserves a comment every time. Your mentor can point you at a real instance in the wild — a good first conversation, and a better second thing to fix.\n\n## Watch out\n\n- The privileged pool may be exported under more than one name, including a plain `db`. Read what you are importing, not what it is called.\n- A green happy-path test says nothing about RLS. User A reading user A's rows passes with policies, without policies, and with a wide-open master key.\n- Never \"fix\" an empty result by loosening the query. Empty is frequently the correct, working answer to a request that should not have been made.\n- RLS enabled with no policy denies everything; RLS never enabled allows everything. A brand new table holding user data is wide open until a migration says otherwise.\n- Bypassing RLS for a legitimate need — an admin screen, a cross-user aggregate — is a design conversation, not a handle swap. The answer is usually a job or an explicit policy.",
+      "tasks": [
+        "Read `src/db/pools.ts` and write one sentence per pool: which identity it connects as, whether RLS applies, and which process is allowed to use it.",
+        "Find the middleware that puts the request-scoped handle on the context, and identify the exact line that stamps the caller's identity onto the connection.",
+        "Run the pool-swap trap on your LOCAL database only, then revert it within the hour.",
+        "Write a test where user B requests user A's row by id and assert an empty result — not a 403.",
+        "Grep the routes directory and the request-path services for direct imports from the pools module, and ask your mentor to explain any hit you find.",
+        "Explain out loud in under 60 seconds why services take the database handle as their first argument instead of importing one."
+      ],
+      "quiz": [
+        {
+          "q": "A route accidentally uses the privileged pool instead of the request-scoped handle. What does the caller see?",
+          "options": [
+            "A 403, because the privileged role is not allowed in a request path",
+            "A 500 from the connection layer",
+            "A normal 200 containing rows that belong to other users",
+            "An empty array, because no identity was set on the connection"
+          ],
+          "answer": 2,
+          "explain": "The privileged role bypasses RLS entirely, so the query succeeds and returns everything. Status codes, logs and monitoring all look perfectly healthy."
+        },
+        {
+          "q": "Through a request-scoped connection, what does asking for another user's row return?",
+          "options": [
+            "403 Forbidden",
+            "An empty result set — the row is filtered out before your code sees it",
+            "The row with its sensitive fields nulled out",
+            "A Postgres permission-denied error"
+          ],
+          "answer": 1,
+          "explain": "RLS is applied as an extra condition on the query, so a foreign row does not exist rather than being refused. Empty looks exactly like working, which is why you must test for it explicitly."
+        },
+        {
+          "q": "Which test actually proves an own-rows-only policy is doing its job?",
+          "options": [
+            "User A lists their own rows and gets them back",
+            "An unauthenticated request receives a 401",
+            "User B requests user A's row by id and receives nothing",
+            "The migration file contains the word policy"
+          ],
+          "answer": 2,
+          "explain": "Only a cross-user read is evidence. The happy path passes identically whether the policy exists, is broken, or was never written."
+        },
+        {
+          "q": "A migration creates a new table holding user data and says nothing about row-level security. What is the state of that table?",
+          "options": [
+            "RLS is off, so any connection with table privileges can read every row",
+            "Locked down by default — RLS denies all access until a policy is added",
+            "It inherits the policies of the schema it was created in",
+            "The ORM applies an implicit own-rows filter based on the user_id column"
+          ],
+          "answer": 0,
+          "explain": "RLS is opt-in per table. Enabled with no policy denies everything; never enabled allows everything. That is why the policy belongs in the same migration that creates the table."
+        },
+        {
+          "q": "Why do services take the database handle as their first parameter instead of importing a connection?",
+          "options": [
+            "It makes the module tree-shakable",
+            "So the caller decides which identity the query runs as — a route passes the request handle, a job passes the privileged one",
+            "Drizzle requires an explicit handle argument",
+            "It reuses connections more efficiently across requests"
+          ],
+          "answer": 1,
+          "explain": "The signature keeps authorization in the caller's hands. A service that imports its own connection takes that choice away from every caller forever."
+        }
+      ],
+      "resources": [
+        {
+          "label": "PostgreSQL — row security policies",
+          "url": "https://www.postgresql.org/docs/current/ddl-rowsecurity.html"
+        },
+        {
+          "label": "Supabase — row level security",
+          "url": "https://supabase.com/docs/guides/database/postgres/row-level-security"
+        },
+        {
+          "label": "roadmap.sh — API security best practices",
+          "url": "https://roadmap.sh/api-security-best-practices"
+        },
+        {
+          "label": "Drizzle ORM overview",
+          "url": "https://orm.drizzle.team/docs/overview"
+        }
+      ],
+      "trap": {
+        "title": "Swap the pool for five minutes",
+        "content": "Do this on your **local** database only. Never against a shared dev database and obviously never against production. You are deliberately creating a data leak; keep it on your machine and revert it the same hour.\n\n1. Seed two users locally, each with a few rows in a table that has an own-rows-only policy.\n2. Call a route that lists your own rows, authenticated as user A. Count them. That is your baseline.\n3. In that route, replace the context-injected handle with the privileged pool imported directly from `src/db/pools.ts`. Change nothing else — same query, same service, same response schema.\n4. Call the route again as user A.\n\nYou are now looking at user B's rows in a response to user A, with a 200 status, valid JSON, a clean log line, and a passing test suite. Sit with that for a second and ask the real question: how would anyone have found this? Not from monitoring. Not from types. Not from tests. Only from a human reading the diff.\n\n5. Revert the change. Then write the test you wish had existed: authenticate as B, request A's row by id, assert an empty result.\n6. Finally, grep the routes directory and the request-path services for direct imports from the pools module. Take any hit to your mentor and ask them to walk you through it — a codebase this size usually has at least one, and understanding why it is there and whether it is safe teaches you more than the trap did."
+      }
+    },
+    "m5-4": {
+      "content": "## The problem\n\nYou ship \"send an email when someone follows you\". Locally you follow a test account, watch the 200 come back, and check the inbox. Nothing. You open the email provider's dashboard: no send attempted. So you re-read the provider config, rotate a key, add a log line around the send call. The log line never prints. There is no error anywhere — not in the API output, not in the database, not in your terminal.\n\nAn hour in, someone asks whether your worker is running. It is not. Or worse, it is, and you enqueued onto the other queue instance, so the job is sitting in a table nothing on this machine polls. Either way the thing that failed produced no signal at all. The 200 was honest: the enqueue really did succeed.\n\n## The idea\n\nA job queue is a table plus a poller. Enqueuing is an INSERT — it succeeds whether or not anything ever reads that row. Consuming is a separate process that polls for rows matching a queue name and runs a handler. Nothing in the enqueue path knows or cares whether a consumer exists.\n\nThis codebase runs **two** independent queue instances, backed by the same Postgres server on different schemas: one dedicated to feed work, one for everything else — notifications, email, media processing, moderation, account deletion, scheduled aggregates. Two instances means two separate sets of tables. `boss.send(...)` and `feedBoss.send(...)` write to different places, and each instance's worker only ever looks at its own.\n\nAnalogy: two mailboxes bolted side by side, same street number, no labels. Post your letter into the wrong slot and it is not lost and not rejected. It is *delivered* — to a box nobody opens. There is no bounce. That is the defining property of silent failure: it is indistinguishable from success right up until someone notices an absence.\n\n## In practice\n\nEnqueuing is a one-liner, which is exactly why the wrong one is easy:\n\n```ts\n// general work: notifications, email, media, moderation\nawait boss.send(JOB_NAMES.SEND_NOTIFICATION, { profileId, kind: \"follow\" });\n\n// feed work: a different instance, a different schema, a different worker\nawait feedBoss.send(JOB_NAMES.PROCESS_DIRTY_POSTS, { postId });\n```\n\nTwo rules cover most of it. Use the constants from the job-names module, never a bare string. And before you call `send`, check where the handler for that job is *registered* — handler registration is the source of truth, because a job only runs where something is listening for it.\n\nThe second failure mode has nothing to do with which instance you picked:\n\n```bash\nbun run dev           # API only. Enqueues fine. Consumes nothing.\nbun run worker        # general jobs\nbun run worker:feed   # feed jobs\n```\n\nAny time you are testing something that ends in \"and then it happens in the background\", start the worker. Note also that the API may create a few queues at boot so `send()` does not throw on an unknown name — helpful for the API, and one more reason a misrouted enqueue looks perfectly healthy.\n\nTo see the truth, ask the database instead of the logs:\n\n```sql\nselect name, state, count(*)\nfrom pgboss.job\ngroup by name, state\norder by count(*) desc;\n```\n\nRows piling up in a created or retry state with nothing ever moving to active means nobody is consuming. And remember the second instance keeps its rows in its own schema, so if a job is missing from one view, look in the other before concluding it was never enqueued at all.\n\n## In your world\n\nYou have already built this architecture out of different parts. In the File Vault project, BullMQ plus Redis gave you a queue and a worker process you had to start separately, and you hit both silent-loss modes on purpose. pg-boss swaps Redis for Postgres as the broker. The practical upside is that an enqueue can share a transaction with your data write, so you cannot commit a row and lose its job. The practical downside is that queue traffic competes with application queries on the same database, and a job table nobody prunes grows forever.\n\nThe model to carry into your first PR: producing and consuming are different processes with different deploys and different failure modes. When something \"did not happen\", the question is never just \"did my code run\". It is *which process was supposed to run it, was that process up, and was it watching the right queue.*\n\n## Watch out\n\n- Enqueue succeeded is not job ran. One log line where you enqueue plus one at the top of the handler turns this from an hour of guessing into ten seconds of reading.\n- Restarting a worker after a long outage fires the whole backlog at once. That is how a quiet bug becomes a thousand push notifications in a minute. Think about what your handlers do when they all run simultaneously.\n- Handlers must be idempotent. At-least-once delivery is normal, and a retried \"send email\" that does not check for prior delivery sends twice.\n- Do not put a big payload in a job. Pass an id and refetch inside the handler, so the job cannot act on a stale copy of the row.\n- Job handlers run on the privileged connection, so RLS will not save you there. A handler that takes a user id from a payload and forgets to scope its query touches everyone's rows.\n- Scheduled work only exists while the process that schedules it is alive. A worker that never boots is a cron that never registers.",
+      "tasks": [
+        "Open the job-names module and the job registration file, then build a two-column list: job name, and which queue instance registers its handler.",
+        "Run trap mode 1 (right name, wrong instance) locally and record what the HTTP response was and what the logs showed.",
+        "Run trap mode 2 (correct instance, worker stopped), then start the worker and watch the whole backlog fire at once.",
+        "Write the SQL you would run at 3am to answer the question: is anything actually consuming this queue?",
+        "Add one log line where you enqueue and one at the top of the handler, then prove you can now tell the two failure modes apart in seconds.",
+        "Pick an existing job handler and describe in writing what happens if it runs twice with the same payload."
+      ],
+      "quiz": [
+        {
+          "q": "You enqueue a job on the wrong pg-boss instance. What happens?",
+          "options": [
+            "`send()` throws because the queue name is unknown to that instance",
+            "The row lands in tables no worker polls, so the job never runs and nothing reports an error",
+            "pg-boss forwards it to whichever instance has a matching handler",
+            "It retries a few times and then lands in a dead-letter queue"
+          ],
+          "answer": 1,
+          "explain": "Two instances means two separate sets of tables. Enqueuing is just an insert, and it succeeds whether or not a consumer for that queue exists anywhere."
+        },
+        {
+          "q": "Only the API process is running. You call an endpoint that enqueues a notification job. What does the caller see?",
+          "options": [
+            "A 500, because no consumer is available",
+            "A 202 with a warning header",
+            "A perfectly normal success response — the enqueue really did succeed",
+            "A request that hangs until a worker appears"
+          ],
+          "answer": 2,
+          "explain": "Producing and consuming are different processes. The API's job ends at the insert, so its response says nothing about whether the work will ever be performed."
+        },
+        {
+          "q": "A worker has been down for six hours and is now restarted. What is the biggest risk?",
+          "options": [
+            "The queued jobs were dropped while the worker was offline",
+            "The entire backlog executes at once: notification floods, rate-limit rejections, sudden load",
+            "pg-boss refuses jobs older than its retention window by default",
+            "The queue schema has to be reset manually before consumption resumes"
+          ],
+          "answer": 1,
+          "explain": "The jobs were never lost, just unclaimed. Restarting releases them all together, which turns a silent outage into a visible incident."
+        },
+        {
+          "q": "Why do job handlers need extra care about scoping queries by user?",
+          "options": [
+            "They run outside HTTP context, so their logs are not captured",
+            "pg-boss handlers cannot use transactions",
+            "They run on the privileged connection, so RLS will not stop a query that forgets to scope by user",
+            "Job payloads are unvalidated by definition"
+          ],
+          "answer": 2,
+          "explain": "Handlers legitimately bypass RLS to act across users. That safety net is gone, so the WHERE clause in a handler is the only thing standing between one user's data and everyone's."
+        },
+        {
+          "q": "What is the right shape for a job payload?",
+          "options": [
+            "An id, with the handler refetching the current state",
+            "The full row, so the handler needs no database access at all",
+            "The whole request context, so the handler can reconstruct the call",
+            "Nothing — handlers should scan for outstanding work"
+          ],
+          "answer": 0,
+          "explain": "A payload is a snapshot from the moment of enqueue. Passing an id keeps the handler working on current data and keeps the queue table small."
+        }
+      ],
+      "resources": [
+        {
+          "label": "pg-boss documentation",
+          "url": "https://github.com/timgit/pg-boss"
+        },
+        {
+          "label": "BullMQ documentation (the queue you already built with)",
+          "url": "https://docs.bullmq.io"
+        },
+        {
+          "label": "PostgreSQL documentation",
+          "url": "https://www.postgresql.org/docs/current/"
+        },
+        {
+          "label": "roadmap.sh — backend track",
+          "url": "https://roadmap.sh/backend"
+        }
+      ],
+      "trap": {
+        "title": "Two ways to lose a job in silence",
+        "content": "Run each mode deliberately, once, locally. Ten minutes each, and you will never lose an hour to this class of bug again.\n\n**Mode 1 — right job name, wrong instance.**\n\n1. Start the API and the general worker. Enqueue a job you can observe (one that writes a row or logs a line). Confirm it runs.\n2. Change one thing: send the same job name through the feed instance instead.\n3. Call the endpoint again. Write down three observations — what the HTTP response was (a 200), what appeared in the worker output (nothing), and what appeared in any error log (nothing).\n4. Query the job tables in both schemas and find your row waiting in the queue that no worker watches.\n\n**Mode 2 — right instance, no consumer.**\n\n1. Revert to the correct instance. Stop the worker process entirely.\n2. Enqueue five jobs. The API keeps answering 200s. From the caller's point of view nothing is wrong.\n3. Query the job table and watch the rows accumulate, unclaimed.\n4. Now start the worker and watch all five fire within seconds of each other. That burst is the production incident in miniature: an outage nobody noticed, ended by a restart nobody sequenced.\n\nFinish by writing one sentence per mode: what signal would have told you sooner? Those two sentences are the logging and alerting you should add to your own projects tonight."
+      }
+    },
+    "m5-5": {
+      "content": "## The problem\n\nYesterday you wrote a migration that adds a column, applied it locally, opened a PR, and it merged. The pipeline applied it to the shared dev database. Today you notice you typed `varchar(50)` where you meant `text`. The obvious fix: open the file, change the type, reset your local database. Green everywhere.\n\nTwo weeks later a teammate reports that a save fails on the dev environment with a \"value too long\" error nobody can reproduce locally. Their fresh clone built a `text` column, because it replayed your edited file from zero. The dev database still has `varchar(50)`, because it ran the original and its migration ledger says that filename is already done. Two databases, one filename, and no record anywhere of which one ran which version of it. Now imagine the same sequence against production, on a table with real rows.\n\n## The idea\n\nA migration is not source code. It is a log entry.\n\nGit history is the analogy you already trust. You do not edit a commit that has been pushed; you push another commit, because other people's clones contain the old one and rewriting shared history makes every copy a lie. A migration file is exactly that, except the other clones are databases: your machine, every teammate's machine, CI's throwaway database, dev, production. The migration tool keeps a table listing which files have already run. Editing a file does not change that table, so your edit is invisible to every database that already applied it and mandatory for every database that has not. The two populations diverge quietly and permanently.\n\nSo: **applied means frozen.** The only way to change the database again is another file.\n\n## In practice\n\nNever hand-name a migration. Generate it:\n\n```bash\nbun run migration:new add_reading_status_to_notes\n```\n\nThe tool stamps the timestamp, and the timestamp *is* the ordering. A hand-crafted filename sorts into the wrong slot, and a migration that runs before the table it alters exists makes for an interesting morning.\n\nSchema changes are **two-sided**. The ORM schema file is what your application's types believe; the migration is what actually happens to the database. Neither reliably generates the other, so you write both and keep them agreed:\n\n```ts\n// src/db/schema/ — what the code believes the table looks like\nexport const notes = pgTable(\"notes\", {\n  id: uuid(\"id\").primaryKey().defaultRandom(),\n  userId: uuid(\"user_id\").notNull(),\n  readingStatus: text(\"reading_status\").notNull().default(\"unread\"),\n});\n```\n\n```sql\n-- supabase/migrations/ — what happens to real databases\nalter table notes\n  add column reading_status text not null default 'unread';\n```\n\nA generator can diff the two and propose SQL. Treat its output as a draft you read line by line, especially anything it wants to drop.\n\nOne thing lives *only* in the migration: **row-level security.** Policies are database objects, not ORM concepts, so the schema file has no idea whether a table is protected. That has a practical consequence worth internalising — you can never answer \"is this table locked down?\" by reading the schema file. You read the migrations. And a new table holding user data is wide open until a migration says otherwise, which is why its policies belong in the same migration that creates it, not in a follow-up you will write after lunch.\n\nFixing yesterday's mistake looks like this instead:\n\n```bash\nbun run migration:new widen_notes_reading_status\n```\n\n```sql\nalter table notes alter column reading_status type text;\n```\n\nTwo files in history, both true, and every database converging on the same end state no matter when it started.\n\n## In your world\n\nYour Task Manager had versioned migrations too, and none of this ever bit you — because you were the only consumer of that database. Editing a file and re-running from scratch is harmless when \"everyone's copy\" means your copy. The rule is not really about migrations. It is about *shared* state. The moment a file has touched a database you do not personally own, it is history.\n\nOn your team the stakes are unusually direct. Merging a PR into `main` is the production deploy, and applying pending migrations to the production database is part of that same automated step. There is no separate \"run the migrations\" button that someone can hold back while they think about it. So the migration in your PR is not a plan — it is the statement that will execute against real user data as soon as the PR is approved. Read it that way, and review other people's that way too.\n\n## Watch out\n\n- \"It is only dev\" is the trap talking. Dev is shared, and CI replays your entire history from zero on every run.\n- Reverting the PR does not revert the migration. Undoing an applied change takes another migration that you have to write and think about, usually under time pressure.\n- Prefer additive: add nullable or defaulted columns, backfill, then tighten in a later migration. A `not null` with no default on a populated table fails on contact.\n- A rename is not one statement. It is add, dual-write, backfill, move readers, drop — with a deprecation window, because old code and old app builds exist.\n- What is instant on your empty local table can take a heavy lock on a large production table. Check whether your statement rewrites the table before assuming it is free.\n- Never edit a migration to \"fix\" a failing deploy under pressure. That is exactly the moment divergence gets created and then forgotten.",
+      "tasks": [
+        "Generate a migration with the tooling and inspect the filename. Write down what would break if you had typed that name by hand.",
+        "Add a column two-sidedly: an entry in the ORM schema file plus a generated SQL migration. Apply it locally and confirm both agree.",
+        "Run the divergence trap on two throwaway local databases.",
+        "Find a migration that creates a table holding user data, read its RLS policies, then confirm the ORM schema file says nothing at all about them.",
+        "Write the correct multi-step plan for renaming a column that mobile clients read, and state where the deprecation window ends.",
+        "Answer in writing: what happens to an already-applied migration when the PR that introduced it gets reverted?"
+      ],
+      "quiz": [
+        {
+          "q": "Why must you never edit a migration that has already been applied?",
+          "options": [
+            "The tool marks applied files read-only at the filesystem level",
+            "The ledger records the filename, not the contents, so databases that already ran it never receive the edit and diverge silently",
+            "The tool detects the change and re-runs the file, causing duplicate statements",
+            "Git history is enough of a record, so the edit is redundant"
+          ],
+          "answer": 1,
+          "explain": "Applied means frozen. The database's record of what ran is a filename, so an edited file produces two different schemas from one apparently identical history."
+        },
+        {
+          "q": "In this codebase, a schema change requires what?",
+          "options": [
+            "Only the ORM schema file — the migration is generated at deploy time",
+            "Only a SQL migration — the ORM infers types at runtime",
+            "Both the ORM schema file and a SQL migration, kept in agreement by hand",
+            "Neither, because a push command syncs the database to the schema"
+          ],
+          "answer": 2,
+          "explain": "The schema file is what the code believes; the migration is what happens to the database. A generator can diff them, but you own keeping them true."
+        },
+        {
+          "q": "Where do row-level security policies live?",
+          "options": [
+            "In the SQL migration — they are database objects the ORM schema knows nothing about",
+            "In the ORM schema file, next to the table definition",
+            "In middleware, applied per request",
+            "Derived automatically from foreign key relationships"
+          ],
+          "answer": 0,
+          "explain": "Because policies exist only in migrations, you can never tell whether a table is protected by reading the schema file. You have to read the migration."
+        },
+        {
+          "q": "You add a `not null` column with no default to a table that already has rows. What happens?",
+          "options": [
+            "It succeeds and existing rows get an empty value",
+            "It fails, because existing rows would violate the constraint",
+            "It succeeds but disables RLS on the table",
+            "It succeeds locally and only fails in CI"
+          ],
+          "answer": 1,
+          "explain": "This is why the safe order is nullable-or-defaulted first, backfill, then tighten in a later migration. Your empty local table hides the problem."
+        },
+        {
+          "q": "A PR containing a migration is merged into `main`. What happens to the production database?",
+          "options": [
+            "Nothing until someone runs a deploy command separately",
+            "Migrations only run when the next release branch is cut",
+            "They wait for manual approval in a database console",
+            "Pending migrations are applied as part of the same automated pipeline that deploys the services"
+          ],
+          "answer": 3,
+          "explain": "Merging to `main` IS the production deploy, migrations included. That makes the SQL in your PR a statement about to execute against real user data, not a proposal."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Supabase — database migrations",
+          "url": "https://supabase.com/docs/guides/deployment/database-migrations"
+        },
+        {
+          "label": "PostgreSQL — ALTER TABLE",
+          "url": "https://www.postgresql.org/docs/current/sql-altertable.html"
+        },
+        {
+          "label": "Drizzle ORM overview",
+          "url": "https://orm.drizzle.team/docs/overview"
+        },
+        {
+          "label": "roadmap.sh — PostgreSQL DBA track",
+          "url": "https://roadmap.sh/postgresql-dba"
+        }
+      ],
+      "trap": {
+        "title": "Edit an applied migration and watch two databases diverge",
+        "content": "Do this in a throwaway sandbox: two local databases, nothing shared, nothing that matters.\n\n1. Create database A and database B, both empty. Apply the existing migration history to A only. Leave B untouched for now.\n2. Write one new migration that adds a column typed `varchar(50)`. Apply it to A. Confirm A has the column and that A's migration ledger lists the filename.\n3. Insert a row into A with a 60-character value for that column. It fails. Good — remember that error.\n4. Now edit that same migration file: change `varchar(50)` to `text`. Do not create a new file.\n5. Apply the full history to B from scratch.\n6. Compare the two schemas. A has `varchar(50)`. B has `text`. Both databases report being fully up to date. Both ledgers list the identical filename.\n7. Insert the same 60-character value into B. It succeeds. You now have two databases that disagree about what is legal, with no record of why.\n8. Ask each database which *version* of that file it ran. Neither can tell you. No hash, no diff, no warning. That silence is the entire lesson.\n\nThen do it properly: restore the file to `varchar(50)`, generate a second migration that alters the column type, and apply the history to both. Compare again — identical schemas, and a history that explains itself to the next person who reads it."
+      }
+    },
+    "m5-6": {
+      "content": "## The problem\n\nYou know this bug from the other side of the wire. A screen shipped where a count rendered as `undefined`, or a section came up blank, because a field the app expected arrived under a different name. You spent a morning proving it was not the app's fault, and by the time the backend fix landed, the broken build was on real phones with a week of store review between you and a patch.\n\nHere is the part worth sitting with. The PR that caused it was green. The backend's own types compiled, because both sides of the rename lived in the same repo and the compiler simply agreed with itself. The tests passed, because the tests were updated in the same commit. The logs showed 200 responses carrying valid JSON. Every quality gate the backend team owns said yes. The only system that failed was one nobody in that PR could see, and its users could not upgrade out of it.\n\n## The idea\n\nA response schema is a contract with clients you cannot deploy.\n\nWeb frontends make this easy to forget: ship a fix, users get it on refresh. Mobile is the hard mode you live in — an install base spread across versions, some months old, some that will never update. The moment a field name ships inside a released binary, the server owes that name to somebody until your analytics say otherwise.\n\nThis codebase makes the contract visible by declaring the request schema and the response schema together on the route definition, which also generates the API documentation. That is a genuine improvement: the shape is in one place instead of scattered across a handler and a doc that drifted. But be precise about what it buys you. It documents the contract and validates the current version. It does not stop you changing it. Nothing in the repo knows what an eight-month-old app build parses.\n\nHence the rule: **additive evolution.** Add, deprecate, then remove on evidence. Never rename in place.\n\n## In practice\n\nA route declares both halves in one object:\n\n```ts\nconst getNoteRoute = createRoute({\n  method: \"get\",\n  path: \"/notes/{id}\",\n  request: { params: z.object({ id: z.string().uuid() }) },\n  responses: {\n    200: {\n      description: \"A single note\",\n      content: { \"application/json\": { schema: NoteSchema } },\n    },\n    404: { description: \"Not found\" },\n  },\n});\n```\n\nThe rename that looks harmless:\n\n```ts\n// before\nconst NoteSchema = z.object({ id: z.string(), commentCount: z.number() });\n\n// after: compiles, tests updated, logs clean, old app renders nothing\nconst NoteSchema = z.object({ id: z.string(), newCommentsCount: z.number() });\n```\n\nThe additive version:\n\n```ts\nconst NoteSchema = z.object({\n  id: z.string(),\n  commentCount: z.number(),     // deprecated: remove once old builds are under 1% of installs\n  newCommentsCount: z.number(), // new name, populated from the same value\n});\n```\n\nTwo field names, one source value, for as long as the old clients live. Then a second PR deletes the old field, and that PR's description cites an adoption number instead of a hunch.\n\nRenames are the obvious case. These are breaking too, and easier to ship by accident:\n\n- making an optional field required in a **request** schema, because old clients do not send it\n- removing a field from a **response**, or letting it start returning null when the client never handled null\n- narrowing an enum, or adding a value the client's switch statement does not handle\n- changing a type at all — a string id to a number, a number to a string, one date format to another\n- adding a new error status that an old client treats as an unexpected failure\n\n## In your world\n\nYou are the best-positioned person on that PR review, and it is worth understanding why. Backend engineers making this call are guessing at the answer to exactly one question: *what is still out there?* You have the real distribution — install base by version, the adoption curve after a release, how long the tail actually is. Bring numbers into the schema conversation and \"we will deprecate it for a while\" becomes \"we can remove this in six weeks, here is the graph\". That is a tech lead move disguised as a data point.\n\nTwo habits to build starting now. When you review a backend PR, diff the response schemas *before* you read the logic — a changed key is a client-visible event no matter how small the diff looks. And when you write one, put the client impact in the description in plain language: which fields changed, which app versions are affected, and what the removal plan is. You have been on the receiving end of the version of this that nobody wrote down. Be the person who writes it down.\n\n## Watch out\n\n- Type-check and tests both pass on a rename because both sides of the contract live in the same repo. Your gates cannot catch this class of bug. Only a human reading the diff can.\n- A 200 with the wrong shape is worse than a 500. A 500 pages somebody; a wrong-shaped 200 renders a blank space and gets blamed on the app.\n- The old field has to keep being *populated*, not merely declared. A schema listing both names while the service fills only the new one is the same outage with extra steps.\n- Deprecation windows need an end condition. Write the removal trigger down when you add the new field, or the schema accumulates fields nobody dares touch.\n- Additive applies to request schemas too. New required inputs, tighter validation and stricter formats all break the clients that predate them.",
+      "tasks": [
+        "Read one route definition and list every part of the contract it declares: method, path, request params and body, each response status, and the response schema.",
+        "Run the silent-rename trap using a consumer that lives outside the repo.",
+        "Take a field your app actually reads and write the full additive plan: add, dual-populate, deprecate with a written removal condition, remove.",
+        "Pull your install-base-by-version numbers and write the one sentence you would paste into a backend PR about when a field can safely be removed.",
+        "List five ways to break a client that are not renames, with one example of each from your own app.",
+        "Review one recent backend PR by diffing the response schemas first, before reading any of the logic."
+      ],
+      "quiz": [
+        {
+          "q": "Why does renaming a response field pass every quality gate on the backend?",
+          "options": [
+            "Response schemas are excluded from type-checking",
+            "Both sides of the contract live in the same repo, so types and tests agree with each other while the external client is invisible to both",
+            "zod validates requests but never responses",
+            "The generated OpenAPI docs regenerate and mask the change"
+          ],
+          "answer": 1,
+          "explain": "Automation can only compare the repo against itself. A shipped mobile build is outside that boundary, so only a human reading the diff can catch this."
+        },
+        {
+          "q": "What is the safe way to change the name of a field clients already depend on?",
+          "options": [
+            "Rename it and ship a mobile fix the same day",
+            "Return the old name only for old user-agent strings",
+            "Add the new field, populate both, deprecate the old one, remove it when adoption data allows",
+            "Version the whole API and leave the old version frozen"
+          ],
+          "answer": 2,
+          "explain": "Additive evolution keeps every already-shipped client working. Removal becomes a separate, evidence-backed decision instead of a gamble."
+        },
+        {
+          "q": "Which of these is NOT breaking for existing clients?",
+          "options": [
+            "Making an optional request field required",
+            "Adding a new optional field to a response",
+            "Narrowing the set of values an enum can return",
+            "Changing an id from a string to a number"
+          ],
+          "answer": 1,
+          "explain": "Old clients ignore fields they do not know about. Everything else on that list changes what an already-shipped parser receives or is allowed to send."
+        },
+        {
+          "q": "Why is a 200 with the wrong shape worse than a 500?",
+          "options": [
+            "Nothing alerts on it — the client renders a blank and the app takes the blame",
+            "It costs more in bandwidth",
+            "Successful responses are not logged",
+            "It bypasses response validation entirely"
+          ],
+          "answer": 0,
+          "explain": "A 500 creates a signal someone is paged for. A wrong-shaped success creates a support ticket about the app, days later, with no server-side evidence."
+        },
+        {
+          "q": "Declaring the response schema on the route definition gives you what, exactly?",
+          "options": [
+            "A guarantee that already-shipped clients keep working",
+            "Automatic API versioning per client",
+            "Generated client code for the mobile app",
+            "Validation of the current shape plus generated docs, but no protection against changing that shape"
+          ],
+          "answer": 3,
+          "explain": "Co-locating the schema makes the contract visible and reviewable. It does not know what any released app build parses, so the deprecation discipline is still yours."
+        }
+      ],
+      "resources": [
+        {
+          "label": "Zod documentation",
+          "url": "https://zod.dev"
+        },
+        {
+          "label": "Hono documentation",
+          "url": "https://hono.dev"
+        },
+        {
+          "label": "OpenAPI specification",
+          "url": "https://spec.openapis.org/oas/latest.html"
+        },
+        {
+          "label": "roadmap.sh — API design track",
+          "url": "https://roadmap.sh/api-design"
+        }
+      ],
+      "trap": {
+        "title": "The silent rename",
+        "content": "You need a consumer that is not the backend. A debug build of the app pointed at your local server is ideal; a saved curl command or a five-line script that prints one field is a fine stand-in. The only requirement is that it lives outside the repo and does not get updated when you edit the schema.\n\n1. Pick a local endpoint returning an object with a field your consumer reads. Run the consumer. Note the value it prints.\n2. Rename that field in the response schema and in the service that populates it. Do it properly and completely, the way you would in a real PR.\n3. Run `bun run lint`, `bun run type-check` and the test suite. All green. Notice how confident that feels — that feeling is the bug.\n4. Run the consumer again, unchanged. It prints undefined, or a blank, or crashes on a null.\n5. Now do it additively: restore the old field alongside the new one, populate both from the same value, and add a comment stating the condition under which the old one gets removed.\n6. Run the consumer again without touching it. It works. Point it at the new field as well. That also works. This is the only state a deploy is allowed to be in.\n\nFinish by writing the two-line PR description you would want to read as the mobile lead: what changed, and which app versions are affected."
+      }
+    },
+    "m5-7": {
+      "content": "## The problem\n\nAsk anyone about their first PR in an unfamiliar codebase and they will tell you they were nervous about the code. Then ask what actually went wrong, and it is never the code. It is opening the PR against the wrong base branch. It is a title CI rejects on a formatting rule. It is a branch four days stale that merges cleanly and breaks the build. It is force-pushing after review started and detonating every comment thread. It is merging on a Friday afternoon without realising the merge itself *was* the deploy.\n\nNone of those are engineering problems, and every one of them costs an afternoon plus a little credibility. Which is exactly why your first PR should be one where the code cannot possibly be the issue.\n\n## The idea\n\nSeparate the two skills and learn them in order.\n\n**PR 1 is a convention cleanup with zero behaviour change.** The codebase requires structured logging and forbids `console.log`; find a stray one and replace it with the proper logger call, or fix a similarly mechanical violation. Nothing about runtime behaviour changes, which frees your entire attention for the pipeline: branch from the right place, title it correctly, watch CI, respond to review, merge, confirm it landed.\n\n**PR 2 is a real vertical slice** — a feature that needs a new table. That is the shape of most backend work: schema, migration, policy, service, route, test. Doing it once end to end is worth more than reading ten files about it.\n\nAnalogy: your first App Store release. You did not learn code signing, provisioning profiles and review turnaround *while* shipping your biggest feature. You shipped something tiny to learn the machine, then used the machine.\n\n## In practice\n\nPR 1, mechanically:\n\n```bash\ngit checkout dev && git pull\ngit checkout -b chore/replace-console-log-with-logger\n# make the change\nbun run lint && bun run type-check && bun test\ngit commit -m \"[CHORE] use structured logger instead of console.log\"\ngit push -u origin HEAD\n```\n\nThe base branch is `dev`. Never `main`. The bracketed type tag is not decoration — `[FEATURE]`, `[FIX]`, `[CHORE]`, `[REFACTOR]`, `[DOCS]`, `[TEST]` is how history and release notes get read months later, and the pipeline may enforce it. Run all three gates locally before you push; CI is a second opinion, not your first.\n\nBefore you delete anything, prove it is unused. \"It looks unused\" is a hypothesis, not a finding:\n\n```bash\ngit grep -n \"thatSymbol\"                          # the whole repo, not just src/\ngit grep -n \"thatSymbol\" -- src/routes/index.ts   # is it still mounted?\n```\n\nThen search the mobile repo for the same string, because an endpoint path or a response field that looks dead in the backend can be very much alive in a shipped build. Write into the PR description how you proved it.\n\nPR 2 is five artifacts plus the test that matters:\n\n1. A table added to the ORM schema under `src/db/schema/`.\n2. A generated SQL migration that creates it.\n3. RLS policies in that same migration, so a user can read only their own rows.\n4. A service function whose first parameter is the database handle.\n5. A route that takes the handle off the request context, mounted in `src/routes/index.ts`, with a deliberate auth decision you state in the PR description.\n\nAnd then the test that separates a feature from a liability:\n\n```ts\n// happy path: A reads A's row\nexpect(await listThings(dbAsUserA)).toHaveLength(1);\n\n// the test that proves the policy: B cannot see A's row\nexpect(await listThings(dbAsUserB)).toHaveLength(0);\n```\n\nThe first assertion passes with no policy at all. Only the second one is evidence.\n\n## In your world\n\nYour mobile PR flow already trained most of these muscles: branch, review, CI, merge. What is different here is the deploy asymmetry, and it is worth naming out loud. On mobile, merging is the *start* of a release — build, submit, review, phased rollout, and a remote kill switch if it goes wrong. Here, merging into `main` IS the release. The pipeline applies pending migrations to the production database and redeploys the services. There is no button between your approval and real users, and a migration that already ran is not undone by reverting the PR.\n\nThat is why the team rule is that everything goes through `dev` first, gets verified on the dev environment, and only then gets cut as a release into `main` — urgent fixes included. As you move toward tech lead, this is the part that becomes yours: not writing the fix, but deciding whether the fix is verified enough to be a deploy.\n\n## Watch out\n\n- Never commit directly to `dev` or `main`. Branch, PR, review, merge.\n- One PR, one concern. Do not smuggle a rename or a \"while I was in there\" refactor into a cleanup — it makes the diff unreviewable and the revert dangerous.\n- A new route without an explicit auth decision has still made a decision. Say which middleware guards it, or say it is deliberately public, in the description.\n- Green happy-path tests are not evidence of a working policy. Write the second-user test, or assume the policy does not work.\n- Do not force-push once a reviewer has commented; you will orphan their threads. Add commits and squash at merge if the repo does that.\n- Bring `dev` into your branch before you request review. A stale branch that merges cleanly can still break the build.",
+      "tasks": [
+        "Ship PR 1: branch from `dev`, replace a convention violation such as a stray console.log with the structured logger, run all three gates locally, and open the PR with a bracketed type tag in the title.",
+        "Before deleting anything, run the prove-it-is-unused checklist including a search of the mobile repo, and write your evidence into the PR description.",
+        "Respond to every review comment, then merge and confirm the change actually landed on `dev`.",
+        "Start PR 2: create the new table two-sidedly — an ORM schema entry plus a generated migration — with its RLS policies in that same migration.",
+        "Write the service function with the database handle as its first parameter, and the route that reads that handle off the request context and is mounted in `src/routes/index.ts`.",
+        "Write two tests: user A sees their own row, and user B gets an empty result when asking for user A's row.",
+        "State the auth decision for your new route explicitly in the PR description — which middleware guards it, or that it is deliberately public."
+      ],
+      "quiz": [
+        {
+          "q": "Why is PR 1 deliberately chosen to have zero behaviour change?",
+          "options": [
+            "New contributors are not trusted with logic changes",
+            "So your whole attention goes to pipeline mechanics — base branch, title convention, CI, review, merge — with no risk from the change itself",
+            "CI rejects functional changes from first-time contributors",
+            "Cleanup PRs are allowed to merge without review"
+          ],
+          "answer": 1,
+          "explain": "First PRs fail on process, not code. Removing the code risk lets you learn the machine once, cheaply, before it matters."
+        },
+        {
+          "q": "What is the correct base branch for a feature branch?",
+          "options": [
+            "`dev`",
+            "`main`, since that is what production runs",
+            "Whichever release branch is currently open",
+            "A long-lived personal branch you merge periodically"
+          ],
+          "answer": 0,
+          "explain": "Everything lands in `dev` first and gets verified on the dev environment. Releases are cut from `dev` into `main` as a separate, deliberate step."
+        },
+        {
+          "q": "What happens when a PR is merged into `main`?",
+          "options": [
+            "Nothing until someone triggers a deploy",
+            "It IS the production deploy: pending migrations are applied to the production database and the services redeploy",
+            "It creates a release candidate for QA to sign off",
+            "The API redeploys but the worker processes do not"
+          ],
+          "answer": 1,
+          "explain": "There is no button between approval and real users. That is why urgent fixes still go through `dev` and a release branch rather than straight to `main`."
+        },
+        {
+          "q": "Your new feature has a passing test where a user reads their own rows. What has that proven about the RLS policy?",
+          "options": [
+            "That it allows the owner and blocks everyone else",
+            "That RLS is enabled on the table",
+            "Essentially nothing — that test passes with no policy at all",
+            "That the policy's using-clause is correct"
+          ],
+          "answer": 2,
+          "explain": "The happy path is identical with and without protection. Only a second-user read that returns nothing is evidence that the policy exists and works."
+        },
+        {
+          "q": "You are about to delete a helper in your cleanup PR because it looks unused. Best next step?",
+          "options": [
+            "Delete it — git makes a revert cheap",
+            "Comment it out for one release and delete it later",
+            "Let CI tell you if anything depended on it",
+            "Grep the whole repo including tests, scripts and the route barrel, then search the mobile repo for the same string"
+          ],
+          "answer": 3,
+          "explain": "Indirect references — config strings, job-name constants, response schema keys — do not show up in an import search, and a shipped app can depend on something the backend considers internal."
+        }
+      ],
+      "resources": [
+        {
+          "label": "GitHub — pull requests",
+          "url": "https://docs.github.com/en/pull-requests"
+        },
+        {
+          "label": "Supabase — database migrations",
+          "url": "https://supabase.com/docs/guides/deployment/database-migrations"
+        },
+        {
+          "label": "PostgreSQL — row security policies",
+          "url": "https://www.postgresql.org/docs/current/ddl-rowsecurity.html"
+        },
+        {
+          "label": "roadmap.sh — backend track",
+          "url": "https://roadmap.sh/backend"
+        }
+      ],
+      "trap": {
+        "title": "The thing that looked unused",
+        "content": "Before your cleanup PR deletes anything, run this on something you are *sure* is dead.\n\n1. Pick a symbol, helper, or response field you believe nothing uses. Write down your confidence out of ten. Commit to the number.\n2. `git grep` it across the whole repo — not just `src/`. Include tests, scripts, seed files and docs.\n3. Check for indirect references: a string in a config map, a job name constant, a key inside a response schema, an entry in the route barrel. Nothing about those shows up in a naive import search.\n4. Search the mobile repo for the same string. This is the step people skip and the one that catches real breakage — a field the backend considers internal can be the exact thing a shipped screen reads.\n5. If it is still dead, delete it, and state in the PR description exactly how you checked.\n\nDo this once and you will find at least one obviously-unused thing that was not. That is the point: you are calibrating your own confidence. The check costs two minutes; the alternative is a revert that has already shipped to production."
+      }
+    },
+    "sq-8": {
+      "content": "## The problem\n\nThe seven days you just spent on the work codebase are a compressed edit. The original is a four-week ramp your backend mentor wrote for exactly this handover, and it does something this phase cannot afford to do: it makes you hit every trap with your own hands *before* you are allowed to read the production implementation.\n\n## The idea\n\nThree stages, with a spoken checkpoint at the end of each week.\n\n**Week 1 — a sandbox with no database.** Build a small HTTP service from scratch on the work stack: runtime, router, middleware, validation, in-memory storage only. No Postgres, no auth library, no queues — the point is to feel the framework without the infrastructure.\n\n**Weeks 2 and 3 — a miniature of the production backend.** Add Postgres and build the four hard subsystems in the order the real system grew them, each one three times: the naive version that works, the deliberate trap, then the fix.\n\n- request-scoped versus privileged connections, and a data leak you cause yourself\n- two queue instances, an enqueue on the wrong one, and a worker you forget to start\n- an applied migration you edit, and two databases that quietly disagree\n- a route contract you rename, with a consumer outside the repo that goes blank\n\n**Week 4 — real PRs.** A convention cleanup to learn the pipeline, then a vertical feature slice: a table, a policy, a service, a route, and a test proving a second user sees nothing.\n\n## In practice\n\nThe Friday checkpoints are the load-bearing part. Each is an oral exam with no notes: your mentor points at a random line of your week's code and asks what breaks if it is deleted. If you cannot answer, that week is not finished. Writing code you cannot defend out loud is the failure mode this entire structure exists to catch.\n\nTwo ground rules run through all four weeks. Hand-type everything before you let a model generate it — the muscle memory is the deliverable, not the file. And read the whole error message before you ask anybody anything, then ask once you are past forty-five minutes. Both halves matter.\n\n## In your world\n\nTake this track if you want depth over speed. You are changing roles rather than adding a skill, and it is cheaper to cause four outages in a sandbox than one in production at 3am. Budget ten focused hours plus the PR work, and run it *instead of* this phase, not alongside it — the traps lose their teeth once you have read about them.\n\nAsk your mentor for the document, and for the Friday slots at the same time — the checkpoints do not work as self-assessment.\n\n## Watch out\n\n- Do not run this in parallel with the main path — you only get to be surprised once.\n- Skip the oral checkpoints and it degrades into a tutorial you followed.\n- The sandbox is not a portfolio project. Build it, defend it, delete it.",
+      "tasks": [
+        "Ask your mentor for the original four-week onboarding document and read it end to end before deciding whether to take the long road.",
+        "Book the four Friday checkpoint slots in advance — they do not work as self-assessment.",
+        "Build the week-1 sandbox service with no database at all: router, middleware, validation, in-memory store.",
+        "For each of the four hard subsystems, build the naive version, cause the trap on purpose, then fix it — and write one paragraph per trap on what signal would have caught it sooner.",
+        "Hand-type everything before letting a model generate it, and log each time you stayed stuck past 45 minutes without asking."
+      ],
+      "quiz": [
+        {
+          "q": "What is the point of the naive, then trapped, then fixed ordering?",
+          "options": [
+            "It is faster than reading the production implementation first",
+            "You feel the failure mode yourself, so the production fix becomes an answer to a problem you actually experienced",
+            "It mirrors the historical order the real system was built in",
+            "Traps are the only reliable way to test a subsystem"
+          ],
+          "answer": 1,
+          "explain": "A fix you read is a fact. A fix that resolves pain you caused yourself is a reflex, and reflexes are what survive a stressful afternoon."
+        },
+        {
+          "q": "What form do the Friday checkpoints take?",
+          "options": [
+            "An oral exam with no notes: your mentor points at a random line and asks what breaks if it is deleted",
+            "A written quiz per subsystem",
+            "A code review of that week's pull requests",
+            "An optional retro if there is time"
+          ],
+          "answer": 0,
+          "explain": "Defending code out loud, cold, is the only test that separates understanding from having typed something that worked."
+        },
+        {
+          "q": "Should you run this track alongside the seven-day version of the phase?",
+          "options": [
+            "Yes, they reinforce each other",
+            "Yes, but skip the sandbox week to save time",
+            "No — it replaces the phase, because the traps lose their teeth once you have read about them",
+            "Only if you skip the real PRs at the end"
+          ],
+          "answer": 2,
+          "explain": "You only get to be surprised by a trap once. Read the compressed version or live the long one, not both."
+        }
+      ],
+      "resources": [
+        {
+          "label": "roadmap.sh — backend track",
+          "url": "https://roadmap.sh/backend"
+        },
+        {
+          "label": "Hono documentation",
+          "url": "https://hono.dev"
+        },
+        {
+          "label": "Supabase local development",
+          "url": "https://supabase.com/docs/guides/local-development"
+        }
+      ]
+    }
+  }
+}
