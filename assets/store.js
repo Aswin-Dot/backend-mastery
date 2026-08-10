@@ -49,6 +49,16 @@ function write(key, value) {
   }
 }
 
+/** True once this browser has its own progress — i.e. not a first visit. */
+export const hasLocalProgress = () => Boolean(localStorage.getItem(PROGRESS_KEY));
+
+/**
+ * Seed a fresh browser from the repo's committed progress.json. Needs no
+ * token (the file is served as a static asset), so the planned start date
+ * and any progress pushed from another device show up on first load.
+ */
+export const seedLocalProgress = (data) => write(PROGRESS_KEY, { ...defaultProgress(), ...data });
+
 /** Local calendar day (YYYY-MM-DD) in the learner's timezone. */
 export function dayStamp(date = new Date(), timezone = "Asia/Kolkata") {
   try {

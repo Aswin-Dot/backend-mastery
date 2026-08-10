@@ -1,6 +1,6 @@
 /** Router, boot, and event wiring. */
 
-import { Store } from "./store.js";
+import { Store, hasLocalProgress, seedLocalProgress } from "./store.js";
 import { roadmapView, moduleView, settingsView } from "./views.js";
 
 const root = document.getElementById("app");
@@ -255,6 +255,13 @@ function route() {
 (async function boot() {
   try {
     const outline = await loadJson("data/outline.json");
+    if (!hasLocalProgress()) {
+      try {
+        seedLocalProgress(await loadJson("progress.json"));
+      } catch {
+        /* no committed progress yet — defaults are fine */
+      }
+    }
     store = new Store(outline);
   } catch (err) {
     root.innerHTML = `<main class="wrap panel"><h1>Could not start</h1>
