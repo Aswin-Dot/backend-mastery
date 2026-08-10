@@ -59,8 +59,11 @@ async function showModule(id) {
   if (!mod) return showRoadmap();
 
   if (!store.isUnlocked(id)) {
-    toast("That module is still locked — finish the earlier days first, or unlock everything in Settings.");
-    return showRoadmap();
+    toast(`Day ${mod.day} is still locked — finish the earlier days first, or unlock everything in Settings.`);
+    // Correct the URL too, so a refresh doesn't land back on the locked module.
+    if (location.hash !== "#/") location.hash = "#/";
+    else showRoadmap();
+    return;
   }
 
   const pack = await phaseContent(mod.phase.id);
