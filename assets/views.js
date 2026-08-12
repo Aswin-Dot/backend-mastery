@@ -4,6 +4,14 @@ import { renderMarkdown, escapeHtml, splitSections } from "./md.js";
 
 const TICK = '<svg viewBox="0 0 12 12"><path d="M2 6.4 4.6 9 10 3.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
+/* A real cog: toothed ring + hub. The previous 8-spoke version read as a sun. */
+const COG = `<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M10.6 2.8a1 1 0 0 1 1-.8h.8a1 1 0 0 1 1 .8l.25 1.5a7.6 7.6 0 0 1 1.72.72l1.24-.88a1 1 0 0 1 1.28.1l.57.57a1 1 0 0 1 .1 1.28l-.88 1.24c.3.53.54 1.11.71 1.72l1.5.25a1 1 0 0 1 .81 1v.8a1 1 0 0 1-.8 1l-1.5.25a7.6 7.6 0 0 1-.72 1.72l.88 1.24a1 1 0 0 1-.1 1.28l-.57.57a1 1 0 0 1-1.28.1l-1.24-.88c-.53.3-1.11.54-1.72.71l-.25 1.5a1 1 0 0 1-1 .81h-.8a1 1 0 0 1-1-.8l-.25-1.5a7.6 7.6 0 0 1-1.72-.72l-1.24.88a1 1 0 0 1-1.28-.1l-.57-.57a1 1 0 0 1-.1-1.28l.88-1.24a7.6 7.6 0 0 1-.71-1.72l-1.5-.25a1 1 0 0 1-.81-1v-.8a1 1 0 0 1 .8-1l1.5-.25a7.6 7.6 0 0 1 .72-1.72l-.88-1.24a1 1 0 0 1 .1-1.28l.57-.57a1 1 0 0 1 1.28-.1l1.24.88a7.6 7.6 0 0 1 1.72-.71z"/>
+  <circle cx="12" cy="12" r="2.9"/>
+</svg>`;
+
+const ARROW_LEFT = '<svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>';
+
 const KIND = { lesson: "read", build: "build", checkpoint: "checkpoint" };
 
 function fmtMins(m) {
@@ -16,9 +24,22 @@ function fmtMins(m) {
 const fmtDate = (d) =>
   d ? d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" }) : "—";
 
+/** "3 hours ago" / "yesterday" — friendlier than a raw timestamp. */
+function relativeTime(date) {
+  const mins = Math.round((Date.now() - date.getTime()) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs} hour${hrs > 1 ? "s" : ""} ago`;
+  const days = Math.round(hrs / 24);
+  if (days === 1) return "yesterday";
+  if (days < 30) return `${days} days ago`;
+  return `on ${fmtDate(date)}`;
+}
+
 /* ── masthead ─────────────────────────────────────────── */
 
-export function masthead(store) {
+export function masthead(store, onSettings = false) {
   const done = store.doneCount();
   const pct = Math.round((done / store.total) * 100);
   const streak = store.streak();
@@ -47,8 +68,9 @@ export function masthead(store) {
           </div>
         </div>
         <nav class="masthead__nav">
-          <a class="iconbtn" href="#/settings" title="Settings" aria-label="Settings">
-            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2.5 12h3M18.5 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>
+          <a class="iconbtn ${onSettings ? "iconbtn--on" : ""}" href="${onSettings ? "#/" : "#/settings"}"
+             title="${onSettings ? "Back to the trail" : "Settings"}" aria-label="${onSettings ? "Back to the trail" : "Settings"}">
+            ${onSettings ? ARROW_LEFT : COG}
           </a>
         </nav>
       </div>
@@ -361,29 +383,64 @@ function renderInlineOnly(text) {
 
 export function settingsView(store) {
   const s = store.settings;
-  const synced = s.lastSynced ? new Date(s.lastSynced).toLocaleString() : "never";
-  const pagesUrl = `https://${s.owner || "your-name"}.github.io/${s.repo || "backend-mastery"}/`;
+  const repoUrl = `https://github.com/${s.owner}/${s.repo}`;
+  const pagesUrl = `https://${(s.owner || "your-name").toLowerCase()}.github.io/${s.repo || "backend-mastery"}/`;
+
+  const syncedAgo = s.lastSynced ? relativeTime(new Date(s.lastSynced)) : null;
+  const done = store.doneCount();
+  const pace = store.pace();
+  const waiting = store.daysUntilStart();
+  const eta = store.etaDate();
+
+  // Progress can be ahead of what's on GitHub if a sync failed while offline.
+  const unsynced = s.lastSynced && store.progress.lastActivity
+    ? new Date(store.progress.lastActivity) > new Date(s.lastSynced)
+    : Boolean(store.progress.lastActivity) && !s.lastSynced;
+
+  const statusNotice = !store.canSync
+    ? `<div class="notice notice--warn">
+         <strong>Sync is off — progress lives in this browser only.</strong>
+         Add a token below so it survives a cleared cache and so the daily alert knows which day you're on.
+       </div>`
+    : `<div class="notice ${unsynced ? "notice--warn" : "notice--ok"}">
+         <strong>${unsynced ? "Local changes not yet pushed." : "Sync is on."}</strong>
+         ${syncedAgo ? `Last pushed to GitHub ${escapeHtml(syncedAgo)}.` : "Nothing pushed yet."}
+         ${unsynced ? `Hit <strong>Sync now</strong> to catch GitHub up.` : ""}
+       </div>`;
+
+  const paceWord = waiting
+    ? `starts in ${waiting} day${waiting > 1 ? "s" : ""}`
+    : pace === null ? "not started"
+    : pace >= 1 ? `${pace} day${pace > 1 ? "s" : ""} ahead`
+    : pace <= -1 ? `${Math.abs(pace)} day${pace < -1 ? "s" : ""} behind`
+    : "on pace";
 
   return `
-    ${masthead(store)}
+    ${masthead(store, true)}
     <main class="wrap panel">
       <div class="reader__top"><a class="backlink" href="#/">← the trail</a></div>
       <h1>Settings</h1>
 
-      <div class="notice ${store.canSync ? "notice--ok" : ""}">
-        <strong>${store.canSync ? "Sync is configured." : "Sync is off — progress is saved in this browser only."}</strong>
-        Last synced: ${escapeHtml(synced)}.
-        ${store.canSync ? "" : " Add a token below to push progress to GitHub so the daily alert knows where you are."}
-      </div>
+      <dl class="statgrid">
+        <div><dt>Progress</dt><dd>${done} <em>/ ${store.total}</em></dd></div>
+        <div><dt>Pace</dt><dd class="${pace !== null && pace <= -2 ? "statgrid__warn" : ""}">${escapeHtml(paceWord)}</dd></div>
+        <div><dt>Streak</dt><dd>${store.streak()} <em>d</em></dd></div>
+        <div><dt>Projected finish</dt><dd>${eta ? escapeHtml(fmtDate(eta)) : "done"}</dd></div>
+      </dl>
+
+      ${statusNotice}
 
       <div class="field">
         <label for="token">GitHub token</label>
-        <input type="password" id="token" value="${escapeHtml(s.token)}" placeholder="github_pat_..." autocomplete="off" spellcheck="false">
+        <input type="password" id="token" value="" autocomplete="off" spellcheck="false"
+               placeholder="${s.token ? "•••••••• saved — paste a new one to replace it" : "github_pat_..."}">
         <p class="field__note">
-          A <strong>fine-grained</strong> personal access token with <code>Contents: Read and write</code> on
+          A <strong>fine-grained</strong> token with <code>Contents: Read and write</code> on
           <code>${escapeHtml(s.owner || "owner")}/${escapeHtml(s.repo || "repo")}</code> and nothing else.
-          Stored only in this browser's localStorage and sent only to api.github.com — it is never committed.
+          Kept in this browser's localStorage, sent only to api.github.com, never committed.
+          ${s.token ? "Leave this blank to keep the token you already saved." : ""}
         </p>
+        ${s.token ? `<p class="field__note"><button class="linkbtn" id="cleartoken">Remove the saved token</button> — turns sync off on this device.</p>` : ""}
       </div>
 
       <div class="field row2">
@@ -441,14 +498,21 @@ export function settingsView(store) {
       <div class="field">
         <div class="field__legend">Daily alert</div>
         <p class="field__note" style="margin-top:0">
-          A GitHub Action runs every morning at 07:00 IST, reads <code>progress.json</code>, works out which day
-          is due, and comments on the pinned <strong>Daily Plan</strong> issue with an @mention — which lands as a
-          push notification if you have the GitHub mobile app installed. Set a repo variable named
-          <code>NTFY_TOPIC</code> to also get an ntfy.sh push.
+          Every morning at <strong>07:00 IST</strong> a GitHub Action reads <code>progress.json</code>, works out
+          which day is due, and comments on the pinned <strong>Daily Plan</strong> issue with an @mention — which
+          arrives as a phone push if you have the GitHub mobile app installed.
+          ${waiting ? `It stays quiet until Day 1 and posts one heads-up the day before.` : ""}
         </p>
-        <p class="field__note">
-          Site URL: <a href="${escapeHtml(pagesUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(pagesUrl)}</a>
-        </p>
+        <ul class="links">
+          <li><a href="${escapeHtml(repoUrl)}/issues?q=is%3Aissue+label%3Adaily-plan" target="_blank" rel="noopener noreferrer">
+            <span>Daily Plan issue</span><small>today's module</small></a></li>
+          <li><a href="${escapeHtml(repoUrl)}/actions/workflows/daily-plan.yml" target="_blank" rel="noopener noreferrer">
+            <span>Run the alert now</span><small>actions → run workflow</small></a></li>
+          <li><a href="${escapeHtml(repoUrl)}/commits/main/progress.json" target="_blank" rel="noopener noreferrer">
+            <span>Your synced progress history</span><small>commits</small></a></li>
+          <li><a href="${escapeHtml(repoUrl)}/settings/variables/actions" target="_blank" rel="noopener noreferrer">
+            <span>Add an ntfy push</span><small>set NTFY_TOPIC</small></a></li>
+        </ul>
       </div>
 
       <hr class="sep">

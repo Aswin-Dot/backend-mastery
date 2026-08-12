@@ -170,14 +170,24 @@ function wireSettings() {
   const val = (id) => document.getElementById(id).value.trim();
 
   document.getElementById("save").addEventListener("click", () => {
+    // The field renders empty when a token is already saved, so an empty
+    // value means "keep it" rather than "clear it".
+    const typed = val("token");
     store.saveSettings({
-      token: val("token"),
+      ...(typed ? { token: typed } : {}),
       owner: val("owner"),
       repo: val("repo"),
       unlockAll: document.getElementById("unlockAll").checked,
     });
     store.setStartDate(val("startsOn"));
     toast("Saved.", "ok");
+    showSettings();
+  });
+
+  document.getElementById("cleartoken")?.addEventListener("click", () => {
+    if (!confirm("Remove the saved token? Progress stays on GitHub, but this device stops syncing.")) return;
+    store.saveSettings({ token: "", lastSynced: null });
+    toast("Token removed — sync is off on this device.");
     showSettings();
   });
 
