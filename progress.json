@@ -2,7 +2,7 @@
   "version": 1,
   "startsOn": "2026-08-12",
   "startedAt": "2026-08-12T10:05:20.689Z",
-  "lastActivity": "2026-08-16T19:28:59.662Z",
+  "lastActivity": "2026-08-17T11:55:30.199Z",
   "dailyMinutes": 90,
   "timezone": "Asia/Kolkata",
   "modules": {
@@ -84,6 +84,27 @@
       ],
       "status": "done",
       "completedAt": "2026-08-16T19:28:59.662Z"
+    },
+    "m0-5": {
+      "tasks": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "quizAnswers": [
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "quizScore": 1,
+      "status": "done",
+      "completedAt": "2026-08-17T11:55:30.199Z"
     }
   }
 }
